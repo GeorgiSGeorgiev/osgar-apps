@@ -1,0 +1,143 @@
+{
+  "version": 2,
+  "robot": {
+    "env": {
+      "OSGAR_LOGS_PREFIX": null
+    },
+    "modules": {
+      "app": {
+          "driver": "tulak_obstacle:TulakObstacle",
+          "in": ["emergency_stop", "pose2d", "rotation", "bumpers_front", "bumpers_rear", "obstacle_zones", "ground_hazard", "nn_mask"],
+          "out": ["desired_steering"],
+          "init": {
+            "max_speed": 0.5,
+            "stop_dist": 0.5,
+            "turning_dist": 0.80,
+            "close_confirm_frames": 5,
+            "min_turn_time_sec": 0.1,
+            "max_turn_time_sec": 8.0,
+            "avoid_obstacles": true,
+            "backup_speed": 0.2,
+            "min_backup_time_sec": 2.0,
+            "max_backup_time_sec": 8.0,
+            "max_realign_time_sec": 3.0,
+            "terminate_on_stop": true,
+            "rows": [200, 350],
+            "center_cols": [290, 350],
+            "left_cols": [100, 260],
+            "right_cols": [380, 540],
+            "ground_hazard_confirm_frames": 3,
+            "terminate_on_ground_hazard": false
+          }
+      },
+      "platform": {
+        "driver": "osgar.platforms.matty:Matty",
+        "in": ["esp_data"],
+        "out": ["esp_data"],
+        "init": {}
+      },
+      "gps": {
+        "driver": "gps",
+        "in": ["raw"],
+        "out": ["nmea_data"],
+        "init": {}
+      },
+      "timer": {
+        "driver": "timer",
+        "in": [],
+        "out": ["tick"],
+        "init": {
+          "sleep": 0.1
+        }
+      },
+      "serial": {
+          "driver": "serial",
+          "in": ["raw"],
+          "out": ["raw"],
+          "init": {"port": "/dev/esp32", "speed": 115200}
+      },
+      "oak": {
+        "driver": "osgar.drivers.oak_camera:OakCamera",
+        "init": {
+          "fps": 10,
+          "is_color": true,
+          "video_encoder": "h265",
+          "h264_bitrate": 2000,
+          "is_depth": true,
+          "is_stereo_images": false,
+          "laser_projector_current": 400,
+          "flood_light_current": 500,
+          "is_imu_enabled": true,
+          "number_imu_records": 10,
+          "disable_magnetometer_fusion": true,
+          "mono_resolution": "THE_400_P",
+          "color_resolution": "THE_1080_P",
+          "color_manual_focus": 130,
+          "sipp_buffer_size": 0,
+          "stereo_median_filter": "KERNEL_5x5",
+          "depth_profile": "ROBOTICS",
+          "stereo_confidence_threshold": 60,
+          "stereo_speckle_filter": false,
+          "stereo_speckle_range": 50,
+          "stereo_spatial_filter": false,
+          "stereo_spatial_filter_alpha": 0.5,
+          "stereo_spatial_filter_delta": 20,
+          "stereo_spatial_filter_hole_filling_radius": 2,
+          "stereo_spatial_filter_num_iterations": 1,
+          "stereo_brightness_filter": true,
+          "stereo_brightness_filter_min": 0,
+          "stereo_brightness_filter_max": 235,
+          "stereo_threshold_filter_min_mm": 200,
+          "stereo_threshold_filter_max_mm": 15000,
+          "stereo_extended_disparity": false,
+          "stereo_subpixel": true,
+          "stereo_left_right_check": true,
+          "sleep_on_start_sec": 1,
+          "model": {
+            "blob": "../robotem-rovne/models/robotourist-093-redroad-20260409-224x224-rgb-chw-1shave.blob"
+          },
+          "nn_config": {
+            "output_format": "LayerFp16",
+            "NN_family": "robotourist",
+            "input_size": "224x224"
+          }
+        }
+      },
+      "obstdet3d_zones": {
+          "driver": "osgar.obstdet3d_zones:ObstacleDetector3DZones",
+          "in": ["depth", "rotation"],
+          "out": ["obstacle_zones", "ground_hazard"],
+          "init": {
+            "vertical_fov_deg": 55,
+            "max_pitch_shift_deg": 20,
+            "pitch_shift_sign": 1,
+            "pitch_smoothing_alpha": 0.05,
+            "min_shift_change_px": 12,
+            "ground_rows": [370, 395],
+            "ground_cols": [200, 460],
+            "max_ground_dist": 2.0,
+            "near_object_suppress_dist": 0.3
+          }
+      }
+    },
+    "links": [
+      ["app.desired_steering", "platform.desired_steering"],
+      ["platform.emergency_stop", "app.emergency_stop"],
+      ["platform.pose2d", "app.pose2d"],
+      ["platform.rotation", "app.rotation"],
+      ["platform.rotation", "obstdet3d_zones.rotation"],
+      ["serial.raw", "platform.esp_data"],
+      ["platform.esp_data", "serial.raw"],
+      ["platform.gps_serial", "gps.raw"],
+      ["timer.tick", "platform.tick"],
+
+      ["platform.bumpers_front", "app.bumpers_front"],
+      ["platform.bumpers_rear", "app.bumpers_rear"],
+
+      ["oak.nn_mask", "app.nn_mask"],
+      ["oak.depth", "obstdet3d_zones.depth"],
+      ["obstdet3d_zones.obstacle_zones", "app.obstacle_zones"],
+      ["obstdet3d_zones.ground_hazard", "app.ground_hazard"]
+    ]
+  }
+}
