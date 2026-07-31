@@ -231,6 +231,13 @@ class TulakObstacle(Node):
         self.last_heading = math.radians(yaw_cdeg / 100.0)
         self.have_imu_heading = True
 
+    def on_qr_code(self, data):
+        """data is the decoded QR text from oak.qr_code. Logging only for
+        now - the QR is intended to carry waypoint coordinates, but acting
+        on them (driving to the waypoint) is a follow-up task, not wired
+        up yet."""
+        print(self.time, 'QR code received:', data)
+
     def on_obstacle_zones(self, data):
         left, center, right = data
         self.last_obstacle = center
