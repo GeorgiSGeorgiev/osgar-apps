@@ -7,7 +7,7 @@
     "modules": {
       "app": {
           "driver": "tulak_obstacle:TulakObstacle",
-          "in": ["emergency_stop", "pose2d", "rotation", "bumpers_front", "bumpers_rear", "obstacle_zones", "ground_hazard", "nn_mask", "qr_code"],
+          "in": ["emergency_stop", "pose2d", "rotation", "bumpers_front", "bumpers_rear", "obstacle_zones", "ground_hazard", "nn_mask", "qr_code", "nmea_data"],
           "out": ["desired_steering"],
           "init": {
             "max_speed": 0.5,
@@ -22,12 +22,13 @@
             "max_backup_time_sec": 8.0,
             "max_realign_time_sec": 3.0,
             "terminate_on_stop": true,
-            "rows": [200, 350],
-            "center_cols": [290, 350],
-            "left_cols": [100, 260],
-            "right_cols": [380, 540],
             "ground_hazard_confirm_frames": 3,
-            "terminate_on_ground_hazard": false
+            "terminate_on_ground_hazard": false,
+            "follow_gps_target": true,
+            "gps_heading_min_baseline_m": 1.0,
+            "waypoint_arrival_dist_m": 3.0,
+            "bearing_blend_road_frac": 0.3,
+            "gps_log_interval_sec": 2.0
           }
       },
       "platform": {
@@ -115,6 +116,11 @@
             "pitch_shift_sign": 1,
             "pitch_smoothing_alpha": 0.05,
             "min_shift_change_px": 12,
+            "camera_tilt_deg": 7.5,
+            "rows": [235, 320],
+            "center_cols": [290, 350],
+            "left_cols": [100, 260],
+            "right_cols": [380, 540],
             "ground_rows": [370, 395],
             "ground_cols": [200, 460],
             "max_ground_dist": 2.5,
@@ -131,6 +137,7 @@
       ["serial.raw", "platform.esp_data"],
       ["platform.esp_data", "serial.raw"],
       ["platform.gps_serial", "gps.raw"],
+      ["gps.nmea_data", "app.nmea_data"],
       ["timer.tick", "platform.tick"],
 
       ["platform.bumpers_front", "app.bumpers_front"],

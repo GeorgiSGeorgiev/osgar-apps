@@ -97,22 +97,87 @@
      a permanent design decision - revisit once you trust the
      detection and want it to recover on its own.
 
+  5. GPS waypoint heading-following. A QR code (read by oak_camera_v3's
+     is_qr_detection) is expected to decode to a Google-Maps-style GPS
+     coordinate string (parse_gps_qr handles the plain decimal form,
+     the same pair embedded in a pasted Maps URL, and DMS). Once a
+     target is set, on_nmea_data (linked from the "gps" module) tracks
+     bearing/distance to it on every fix.
+
+     Deliberately NOT using this platform's IMU-derived 'rotation' (aka
+     self.last_heading) for this: there is no confirmed magnetometer/
+     absolute-heading source behind it (see matty.py - yaw is raw
+     ESP32 IMU output, sign convention undocumented), so it may only be
+     reliable as a RELATIVE heading, of no known fixed relationship to
+     true north. A GPS bearing, by contrast, IS referenced to true
+     north. Comparing the two directly would silently steer toward some
+     rotated-by-an-unknown-amount direction, wrong in a way that's hard
+     to notice without outdoor testing. Instead, current heading of
+     travel is derived the same way osgar-apps/roboorienteering/ro.py
+     already does it for this exact robot: by differencing consecutive
+     GPS fixes (self.travel_heading), so it's compared against
+     bearing_to_target using the SAME (compass) convention on both
+     sides - see initial_bearing()'s docstring. The tradeoff: heading is
+     unknown (falls back to pure road-following) until the robot has
+     physically moved at least gps_heading_min_baseline_m since the
+     last fix used as a baseline - consumer GPS without RTK is easily
+     1-5m noisy, so this can't be shrunk much below the roboorienteering
+     precedent (1.0m) without the derived heading being mostly noise.
+
+     Priority is, highest first: obstacle avoidance (entirely unchanged
+     above) > drivable area > GPS bearing. This is implemented by
+     _drive_steering() only ever running from contexts where obstacle
+     avoidance already had first say (see call sites), and internally
+     blending last_dir (road) with the bearing-derived steering using
+     left_road_frac/right_road_frac as a proxy for "how much road is
+     actually there to steer onto" - full road-following when the mask
+     shows ~no road on the side the bearing wants, scaling up to full
+     bearing-following as road_frac climbs past bearing_blend_road_frac.
+     follow_gps_target=False disables all of this (falls back to plain
+     last_dir, i.e. tulak_obstacle's original behaviour) for testing
+     without GPS/QR involved. Once within waypoint_arrival_dist_m, the
+     robot stops (persistently, like ground_hazard) rather than trying
+     to hold position precisely; reading a new QR sets a new target and
+     resumes, and reading the literal text "abort"/"cancel" clears the
+     current target without setting a new one. The target only ever
+     changes via one of those three (reached / new QR / abort QR) -
+     it does NOT expire or reset on its own, including while GPS has no
+     fix (on_nmea_data logs "no fix yet" but leaves target_lat/lon
+     untouched). on_qr_code also ignores a re-read of whatever text is
+     already active (same coordinates, or "abort" when already
+     aborted) - the camera redecodes and republishes a code every frame
+     it's visible (oak_camera_v3.py dedups its own publishes too, but
+     this is a second line of defense), so without this a code held in
+     view for a couple of seconds would otherwise spam identical "New
+     waypoint target" lines and repeatedly reset waypoint_reached. This
+     blending is a first-pass heuristic with no field testing behind it
+     at all (written at night, can't test outside) - watch
+     left_road_frac/right_road_frac/bearing_to_target via verbose
+     logging before trusting it to actually leave the road.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
-  terminate_on_ground_hazard) have defaults, so existing JSON keeps
-  working unchanged except for wiring the new ground_hazard input (see
-  the updated config file). stop_dist/turning_dist/close_confirm_frames
-  behaviour is untouched. Bench-test before trusting this outdoors -
-  it has not been run against the real osgar harness/hardware.
+  terminate_on_ground_hazard, follow_gps_target,
+  gps_heading_min_baseline_m, waypoint_arrival_dist_m,
+  bearing_blend_road_frac) have defaults, so existing JSON keeps working
+  unchanged except for wiring the new ground_hazard/qr_code/nmea_data
+  inputs (see the updated config file). stop_dist/turning_dist/
+  close_confirm_frames behaviour is untouched. Bench-test before
+  trusting this outdoors - it has not been run against the real osgar
+  harness/hardware.
 """
 import datetime
 import math
+import re
 from enum import Enum
 
 import numpy as np
 
 from osgar.node import Node
 from osgar.exceptions import EmergencyStopException
+
+
+EARTH_RADIUS_M = 6371000
 
 
 def mask_center(mask):
@@ -126,6 +191,66 @@ def mask_center(mask):
 def normalize_angle(angle):
     """wrap to (-pi, pi]"""
     return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """great-circle distance in meters between two decimal-degree points"""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def initial_bearing(lat1, lon1, lat2, lon2):
+    """Compass bearing (radians, 0=north, clockwise/east-positive) from
+    point 1 to point 2 along the great circle. NOT the same convention as
+    this platform's rotation/pose2d heading (0=east, anticlockwise) - by
+    design, an initial_bearing() result is only ever compared against
+    another initial_bearing() result in this file (see _drive_steering),
+    never mixed with self.last_heading, so the convention cancels out and
+    never needs converting."""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return math.atan2(y, x) % (2 * math.pi)
+
+
+def parse_gps_qr(text):
+    """Extract (lat, lon) in decimal degrees from a Google-Maps-style
+    coordinate string - what you get long-pressing a pin in Maps and
+    tapping the coordinates to copy them, e.g. "50.087451, 14.420671".
+    Also matches the same pair embedded in a pasted Maps URL
+    (.../@50.087451,14.420671,17z or ?q=50.087451,14.420671), and the
+    DMS format Maps sometimes displays instead (50 deg 5'14.8"N
+    14 deg 25'14.4"E). Returns None if no plausible coordinate pair is
+    found (out-of-range values are rejected as a sanity check, e.g. to
+    avoid matching an unrelated decimal pair)."""
+    text = text.strip()
+
+    m = re.search(r'(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)', text)
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        if abs(lat) <= 90 and abs(lon) <= 180:
+            return lat, lon
+
+    m = re.search(
+        r'(\d{1,3})[°]\s*(\d{1,2})[\'′]\s*([\d.]+)["″]\s*([NS])[,\s]+'
+        r'(\d{1,3})[°]\s*(\d{1,2})[\'′]\s*([\d.]+)["″]\s*([EW])',
+        text)
+    if m:
+        d1, mi1, s1, hemi1, d2, mi2, s2, hemi2 = m.groups()
+        lat = float(d1) + float(mi1) / 60 + float(s1) / 3600
+        lon = float(d2) + float(mi2) / 60 + float(s2) / 3600
+        if hemi1 == 'S':
+            lat = -lat
+        if hemi2 == 'W':
+            lon = -lon
+        if abs(lat) <= 90 and abs(lon) <= 180:
+            return lat, lon
+
+    return None
 
 
 class State(Enum):
@@ -175,6 +300,24 @@ class TulakObstacle(Node):
         self.terminate_on_ground_hazard = config.get('terminate_on_ground_hazard', True)
         self.ground_hazard_streak = 0
         self.ground_hazard_active = False
+
+        # GPS waypoint heading-following (see notes at top of file) - target
+        # comes from a decoded QR code, current heading from differencing
+        # consecutive GPS fixes (NOT from IMU 'rotation' - deliberately;
+        # see docstring)
+        self.follow_gps_target = config.get('follow_gps_target', True)  # <-- on/off switch
+        self.gps_heading_min_baseline_m = config.get('gps_heading_min_baseline_m', 1.0)
+        self.waypoint_arrival_dist_m = config.get('waypoint_arrival_dist_m', 3.0)
+        self.bearing_blend_road_frac = config.get('bearing_blend_road_frac', 0.3)
+        self.gps_log_interval = datetime.timedelta(seconds=config.get('gps_log_interval_sec', 2.0))
+        self.target_lat = None
+        self.target_lon = None
+        self.target_dist = None
+        self.bearing_to_target = None
+        self.last_gps_pos = None  # (lat, lon) of the last fix used as a heading baseline
+        self.travel_heading = None  # radians, compass convention - see initial_bearing()
+        self.waypoint_reached = False
+        self.last_gps_log_time = None
 
         # obstacle zones (from ObstacleDetector3DZones)
         self.last_obstacle = float('inf')  # center distance, meters
@@ -232,11 +375,100 @@ class TulakObstacle(Node):
         self.have_imu_heading = True
 
     def on_qr_code(self, data):
-        """data is the decoded QR text from oak.qr_code. Logging only for
-        now - the QR is intended to carry waypoint coordinates, but acting
-        on them (driving to the waypoint) is a follow-up task, not wired
-        up yet."""
-        print(self.time, 'QR code received:', data)
+        """data is the decoded QR text from oak.qr_code, expected to carry
+        GPS coordinates (Google-Maps-style) for a new waypoint target, or
+        the literal word "abort"/"cancel" to clear the current one.
+
+        The same physical QR code gets redecoded and republished on every
+        frame it's visible (no debouncing upstream, ~fps times/sec - see
+        oak_camera_v3.py), so both branches below are no-ops whenever the
+        decoded text doesn't actually change anything: re-reading the
+        SAME coordinates must not reset waypoint_reached or re-print
+        every ~100ms just because the code is still sitting in the
+        camera's view, and re-reading "abort" after already-aborted must
+        not do anything either."""
+        text = data.strip()
+        if text.lower() in ('abort', 'cancel'):
+            if self.target_lat is not None:
+                print(self.time, 'QR abort - clearing waypoint target', (self.target_lat, self.target_lon))
+                self.target_lat = None
+                self.target_lon = None
+                self.bearing_to_target = None
+                self.target_dist = None
+                self.waypoint_reached = False
+            return
+
+        parsed = parse_gps_qr(text)
+        if parsed is None:
+            print(self.time, 'QR code received but no GPS coordinates found in it:', data)
+            return
+        if parsed == (self.target_lat, self.target_lon):
+            return  # same target already active - just still in view, not a new read
+
+        self.target_lat, self.target_lon = parsed
+        self.waypoint_reached = False
+        # recomputed on the next GPS fix rather than here, since we don't
+        # know our own current position at QR-read time
+        self.bearing_to_target = None
+        self.target_dist = None
+        print(self.time, 'New waypoint target from QR:', self.target_lat, self.target_lon)
+        if self.last_gps_pos is not None:
+            # we already have a fix from before this QR was read - report
+            # bearing/distance immediately instead of waiting for the next
+            # on_nmea_data (bearing_to_target above is None until then)
+            self.target_dist = haversine_distance(*self.last_gps_pos, self.target_lat, self.target_lon)
+            self.bearing_to_target = initial_bearing(*self.last_gps_pos, self.target_lat, self.target_lon)
+            print(self.time, 'GPS', self._gps_status_line(*self.last_gps_pos))
+        else:
+            print(self.time, 'GPS: no fix yet, own position unknown')
+
+    def on_nmea_data(self, data):
+        lat, lon = data.get('lat'), data.get('lon')
+        if lat is not None and lon is not None:
+            if data.get('lat_dir') == 'S':
+                lat = -lat
+            if data.get('lon_dir') == 'W':
+                lon = -lon
+
+            had_heading = self.travel_heading is not None
+            if self.last_gps_pos is not None:
+                moved = haversine_distance(*self.last_gps_pos, lat, lon)
+                if moved >= self.gps_heading_min_baseline_m:
+                    # only advance the heading baseline once we've moved far
+                    # enough for the bearing between fixes to be meaningful -
+                    # plain GPS noise alone (no RTK) is easily 1-5m, a shorter
+                    # baseline would make travel_heading mostly noise
+                    self.travel_heading = initial_bearing(*self.last_gps_pos, lat, lon)
+                    self.last_gps_pos = (lat, lon)
+            else:
+                self.last_gps_pos = (lat, lon)
+            if not had_heading and self.travel_heading is not None:
+                print(self.time, 'GPS heading established: %.0f deg' % math.degrees(self.travel_heading))
+
+            if self.target_lat is not None:
+                self.target_dist = haversine_distance(lat, lon, self.target_lat, self.target_lon)
+                self.bearing_to_target = initial_bearing(lat, lon, self.target_lat, self.target_lon)
+                if not self.waypoint_reached and self.target_dist < self.waypoint_arrival_dist_m:
+                    self.waypoint_reached = True
+                    print(self.time, 'waypoint reached (%.1fm), stopping' % self.target_dist)
+
+        # throttled status log runs regardless of whether this fix was
+        # valid, so a missing fix is visible ("no fix yet") instead of
+        # the log just going quiet and looking like the target expired -
+        # it hasn't, target_lat/target_lon are untouched by a bad fix
+        if self.last_gps_log_time is None or (self.time - self.last_gps_log_time) >= self.gps_log_interval:
+            self.last_gps_log_time = self.time
+            if lat is not None and lon is not None:
+                print(self.time, 'GPS', self._gps_status_line(lat, lon))
+            elif self.target_lat is not None:
+                print(self.time, 'GPS: no fix yet - target still set (%.6f,%.6f), waiting' %
+                      (self.target_lat, self.target_lon))
+            else:
+                print(self.time, 'GPS: no fix yet, no target set')
+
+        if self.last_gps_log_time is None or (self.time - self.last_gps_log_time) >= self.gps_log_interval:
+            self.last_gps_log_time = self.time
+            print(self.time, 'GPS', self._gps_status_line(lat, lon))
 
     def on_obstacle_zones(self, data):
         left, center, right = data
@@ -324,6 +556,66 @@ class TulakObstacle(Node):
         left = self.left_dist if self.left_dist is not None else float('inf')
         right = self.right_dist if self.right_dist is not None else float('inf')
         return 1 if left >= right else -1
+
+    def _drive_steering(self):
+        """Steering to use when NOT actively avoiding an obstacle - i.e.
+        this only ever runs from a context where obstacle avoidance has
+        already had first say (it is highest priority: it fully overrides
+        this method's result by never calling it while avoiding). Within
+        that, drivable-area (last_dir, from the road mask) still wins over
+        the GPS bearing whenever the mask shows little/no road on the side
+        the bearing wants: bearing_blend_road_frac is the road-fraction
+        (see on_nn_mask - the theoretical max is ~0.5 since the always-
+        masked-out sky half counts toward the mean) at which the bearing
+        gets full trust; below that it's scaled down proportionally, pure
+        road-following at 0. This is a first-pass heuristic, not field
+        tuned - watch left_road_frac/right_road_frac against turn_streak
+        false positives once you can test outside."""
+        if not self.follow_gps_target or self.bearing_to_target is None or self.travel_heading is None:
+            return self.last_dir  # no usable GPS heading yet - pure road following
+
+        error = normalize_angle(self.travel_heading - self.bearing_to_target)
+        bearing_steering = max(-self.turn_angle, min(self.turn_angle, error))
+
+        road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
+        if self.bearing_blend_road_frac > 0:
+            weight = min(1.0, road_frac_that_way / self.bearing_blend_road_frac)
+        else:
+            weight = 1.0
+        return (1 - weight) * self.last_dir + weight * bearing_steering
+
+    def _following_status(self):
+        """Human-readable reason why GPS bearing-following is or isn't
+        currently steering the robot - logging only, mirrors the guard
+        clauses in _drive_steering()."""
+        if self.target_lat is None:
+            return 'no target'
+        if not self.follow_gps_target:
+            return 'disabled (follow_gps_target=False)'
+        if self.waypoint_reached:
+            return 'arrived, stopped'
+        if self.travel_heading is None:
+            return 'target set, waiting for GPS heading (need >=%.1fm of movement)' % self.gps_heading_min_baseline_m
+        return 'following'
+
+    def _gps_status_line(self, lat, lon):
+        """One-line summary of everything on_qr_code/on_nmea_data know
+        right now: own position, direction of travel, target and bearing/
+        distance to it, what steering that would currently produce, and
+        whether it's actually being applied (see _following_status)."""
+        parts = ['pos=(%.6f,%.6f)' % (lat, lon)]
+        if self.travel_heading is not None:
+            parts.append('heading=%.0fdeg' % math.degrees(self.travel_heading))
+        else:
+            parts.append('heading=unknown')
+        if self.target_lat is not None:
+            parts.append('target=(%.6f,%.6f)' % (self.target_lat, self.target_lon))
+            parts.append('bearing=%.0fdeg dist=%.1fm' % (math.degrees(self.bearing_to_target), self.target_dist))
+        else:
+            parts.append('target=none')
+        parts.append('steering_now=%.0fdeg' % math.degrees(self._drive_steering()))
+        parts.append('(%s)' % self._following_status())
+        return ' '.join(parts)
 
     def _enter_backing_up(self, steering):
         self.state = State.BACKING_UP
@@ -416,7 +708,7 @@ class TulakObstacle(Node):
                     # fighting to return to it
                     print(self.time, 'escape mode: accepting new heading instead of realigning')
                     self._enter_drive()
-                    speed, steering_angle = self.max_speed, self.last_dir
+                    speed, steering_angle = self.max_speed, self._drive_steering()
                 else:
                     self.state = State.REALIGNING
                     self.state_start_time = self.time
@@ -427,7 +719,7 @@ class TulakObstacle(Node):
             if abs(error) < self.realign_tolerance or elapsed > self.max_realign_time:
                 print(self.time, 'realigned, resuming road following')
                 self._enter_drive()
-                speed, steering_angle = self.max_speed, self.last_dir
+                speed, steering_angle = self.max_speed, self._drive_steering()
             else:
                 steering_angle = max(-self.realign_max_steering,
                                      min(self.realign_max_steering, error * self.realign_gain))
@@ -453,8 +745,11 @@ class TulakObstacle(Node):
                 self._enter_turning()
                 speed, steering_angle = self.avoid_speed, self.turn_sign * self.avoid_steering
 
+        elif self.waypoint_reached:
+            speed, steering_angle = 0, 0
+
         else:
-            speed, steering_angle = self.max_speed, self.last_dir
+            speed, steering_angle = self.max_speed, self._drive_steering()
 
         if self.verbose:
             print(self.time, self.state, speed, steering_angle, self.last_obstacle,
