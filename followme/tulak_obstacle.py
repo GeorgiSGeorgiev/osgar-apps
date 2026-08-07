@@ -325,6 +325,12 @@ class TulakObstacle(Node):
         self.right_dist = None
         self.stop_streak = 0
         self.turn_streak = 0
+        # the OAK pipeline takes several seconds to boot, during which
+        # last_obstacle/left_dist/right_dist above still hold their
+        # "assume clear" init values - stay stopped in on_pose2d until the
+        # first real obstacle_zones frame arrives instead of driving on
+        # that default (see on_pose2d and on_obstacle_zones)
+        self.have_obstacle_data = False
 
         # road following
         self.last_dir = 0  # steering angle (rad), from nn_mask
@@ -471,6 +477,9 @@ class TulakObstacle(Node):
             print(self.time, 'GPS', self._gps_status_line(lat, lon))
 
     def on_obstacle_zones(self, data):
+        if not self.have_obstacle_data:
+            self.have_obstacle_data = True
+            print(self.time, 'first obstacle_zones reading received, releasing startup hold')
         left, center, right = data
         self.last_obstacle = center
         self.left_dist = left
@@ -659,6 +668,15 @@ class TulakObstacle(Node):
         xy = (x_mm / 1000.0, y_mm / 1000.0)
         if not self.have_imu_heading:
             self.last_heading = math.radians(heading_cdeg / 100.0)
+
+        if not self.have_obstacle_data:
+            # camera pipeline still booting (OAK-D Pro typically takes a
+            # few seconds) - pose2d already flows from the platform at
+            # this point, but last_obstacle/left_dist/right_dist are still
+            # unset "assume clear" defaults, not a confirmed clear path.
+            # Stay stopped rather than drive blind.
+            self.send_speed_cmd(0, 0)
+            return
 
         if self.ground_hazard_active:
             # confirmed drop-off/staircase - stay stopped every cycle,
