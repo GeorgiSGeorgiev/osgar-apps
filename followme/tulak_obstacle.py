@@ -279,17 +279,111 @@
      same idea as the pitch smoothing in obstdet3d_zones.py, just over
      wrap-around angles this time, so a plain linear EMA would be wrong.
 
+  10. Adaptive stop_dist/turning_dist/cruising speed - so ONE config can
+      cover both a cramped indoor room and open outdoor ground, instead
+      of needing separate hand-tuned profiles. Two closed-loop pieces,
+      both in on_pose2d, both defaulting on (adaptive_distances,
+      adaptive_speed):
+
+      _adaptive_speed() scales cruising speed down as sensed clearance
+      (min of center/left/right, None-as-inf same as elsewhere) shrinks,
+      linearly between min_speed and max_speed, saturating at full
+      max_speed once clearance reaches speed_clearance_ceiling. This
+      alone is what makes cramped spaces "just work" without a separate
+      profile: the robot naturally crawls where it's tight and speeds up
+      where it's open, driven by the same sensor already used for
+      avoidance.
+
+      _update_adaptive_distances() then derives stop_dist/turning_dist
+      from a plain stopping-distance model - reaction distance
+      (v * (close_confirm_frames/depth_fps + reaction_margin_sec), the
+      debounce dead time already baked into the state machine, now made
+      explicit as a distance) plus braking distance (v^2/(2*decel_mps2))
+      plus a fixed margin, clamped to [stop_dist_min, stop_dist_max].
+      turning_dist adds a further v*turning_lead_sec on top, clamped to
+      [turning_dist_min, turning_dist_max] - the gap between the two
+      widens with speed, same as the reaction distance does, instead of
+      staying a fixed 0.1-0.2m regardless of how fast the robot is
+      going. Crucially this reads _last_commanded_speed - whatever was
+      ACTUALLY sent last cycle, not self.max_speed - so stop_dist
+      correctly shrinks during BACKING_UP/TURNING (slower than cruising)
+      instead of staying pinned to cruising-speed math while already
+      moving cautiously.
+
+      decel_mps2 is an ESTIMATE (chosen so the formula reproduces the
+      hand-tuned stop_dist~0.6m already validated at max_speed=0.5 in
+      the field - not independent bench data). To calibrate for real:
+      drive at a known speed, command a stop, measure the distance, back
+      out a = v^2/(2*d). The min/max bounds on both distances and speed
+      are the actual safety net if the formula is ever wrong for your
+      platform/terrain - set adaptive_distances/adaptive_speed to False
+      to fall back to the old flat stop_dist/turning_dist/max_speed
+      behaviour outright.
+
+      One real limitation this does NOT solve: a truly tiny room smaller
+      than Matty's own turning/backup footprint can't be fixed by
+      slowing down - that's a fixed geometric constraint independent of
+      speed. Adaptive distances only handle the speed axis of "cramped
+      vs open", not "does the maneuver physically fit here at all".
+
+  11. Free-space steering (depth_profile) + smoothest-path blend +
+      steering rate limit. Together these are meant to keep the robot
+      away from a tightening side well before turning_dist would trigger
+      the discrete avoidance state machine, so an ordinary narrow
+      driveway doesn't need the big backup+turn maneuver just to stay
+      roughly centered - the state machine still owns "something forced
+      an unavoidable maneuver", this only handles "which way should
+      ordinary cruising lean".
+
+      _free_space_steering() reads the new depth_profile (a coarse N-bin
+      distance scan across the frame, from ObstacleDetector3DZones - see
+      that module's docstring) and aims toward whichever bins have the
+      most clearance beyond a threshold derived from the CURRENT (and,
+      with item 10 on, currently speed-scaled) turning_dist times
+      free_space_lead_margin - so this signal's "is that open enough"
+      question always tracks whatever turning_dist currently means,
+      rather than drifting out of sync with it. _drive_steering() blends
+      this with last_dir (the road mask) via free_space_weight - this
+      pairing is the answer to "pick the smoothest path that's also
+      marked drivable": smoothness/openness from depth, drivable-marking
+      from the road mask, combined rather than either alone deciding.
+      Deliberately NOT part of the State enum/state machine - this is a
+      continuous control question, not a discrete one, and forcing it
+      into the state machine would only complicate the one thing that
+      actually needs to stay simple and decisive (the avoidance
+      maneuvers themselves).
+
+      Finally, _rate_limit_steering() caps how fast _drive_steering()'s
+      blended result can change (max_steering_rate_deg_s, continuous
+      across a DRIVE<->avoidance transition via _last_commanded_steering)
+      - applied ONLY to ordinary cruising, never to the avoidance state
+      machine's own steering, which still needs to commit decisively
+      the instant it's triggered.
+
+  12. enable_ground_hazard: off/on switch for the drop-off/staircase
+      reaction (item 4) - ObstacleDetector3DZones keeps computing and
+      publishing ground_hazard either way (unchanged, still useful for
+      logging/diagnostics), this just makes on_ground_hazard a no-op
+      when False, e.g. for terrain where the ground window's calibration
+      trap (see obstdet3d_zones.py's docstring) isn't worth fighting yet.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
   gps_heading_min_baseline_m, waypoint_arrival_dist_m,
   bearing_blend_road_frac, retrace_buffer_sec, scan_min_sweep_deg,
   scan_confident_margin, side_zone_weight, bearing_penalty_weight,
-  gps_heading_smoothing_alpha) have defaults, so existing
-  JSON keeps working unchanged except for wiring the new ground_hazard/
-  qr_code/nmea_data inputs (see the updated config file). stop_dist/
-  turning_dist/close_confirm_frames behaviour is untouched. Bench-test
-  before trusting this outdoors - it has not been run against the real
+  gps_heading_smoothing_alpha, adaptive_distances, decel_mps2,
+  reaction_margin_sec, depth_fps, stop_dist_margin_m, turning_lead_sec,
+  stop_dist_min, stop_dist_max, turning_dist_min, turning_dist_max,
+  adaptive_speed, min_speed, speed_clearance_ceiling, free_space_weight,
+  free_space_lead_margin, max_steering_rate_deg_s, enable_ground_hazard)
+  have defaults, so existing JSON keeps working unchanged except for
+  wiring the new ground_hazard/qr_code/nmea_data/depth_profile inputs
+  (see the updated config file). close_confirm_frames behaviour is
+  untouched; stop_dist/turning_dist are now adaptive BY DEFAULT (item
+  10) - set adaptive_distances=False to keep them flat like before.
+  Bench-test before trusting this outdoors - it has not been run against the real
   osgar harness/hardware.
 """
 import datetime
@@ -397,6 +491,11 @@ class TulakObstacle(Node):
         self.turn_angle = math.radians(config.get('turn_angle_deg', 20))
 
         # obstacle safety / avoidance
+        # stop_dist/turning_dist below are the STATIC starting values -
+        # if adaptive_distances is on (default, see further down and item
+        # 10 at top of file), on_pose2d recomputes both every cycle from
+        # the robot's actual current speed instead, and these are only
+        # what's used before the first cycle / whenever that's off.
         self.stop_dist = config.get('stop_dist', 0.5)  # meters, hard stop - always active
         self.turning_dist = config.get('turning_dist', 1.0)  # meters, start avoidance turn
         self.close_confirm_frames = config.get('close_confirm_frames', 3)
@@ -408,6 +507,38 @@ class TulakObstacle(Node):
         self.backup_speed = config.get('backup_speed', 0.2)
         self.min_backup_time = datetime.timedelta(seconds=config.get('min_backup_time_sec', 1.0))
         self.max_backup_time = datetime.timedelta(seconds=config.get('max_backup_time_sec', 4.0))
+
+        # adaptive stop_dist/turning_dist (item 10 at top of file) -
+        # derived every cycle from the robot's actual last-commanded
+        # speed via a simple stopping-distance model (reaction distance +
+        # braking distance + margin), instead of flat numbers that
+        # silently stop making sense the moment you run at a different
+        # speed than whatever they were hand-tuned for. decel_mps2 is an
+        # ESTIMATE, not bench-measured - see item 10 for how to calibrate
+        # it for real (drive at a known speed, command a stop, measure
+        # the distance, back out a = v^2/(2*d)).
+        self.adaptive_distances = config.get('adaptive_distances', True)
+        self.decel_mps2 = config.get('decel_mps2', 1.0)
+        self.reaction_margin_sec = config.get('reaction_margin_sec', 0.2)
+        self.depth_fps = config.get('depth_fps', 10)  # must match the oak module's own fps - not auto-linked, separate config block
+        self.stop_dist_margin_m = config.get('stop_dist_margin_m', 0.15)
+        self.turning_lead_sec = config.get('turning_lead_sec', 0.4)
+        self.stop_dist_min = config.get('stop_dist_min', 0.3)
+        self.stop_dist_max = config.get('stop_dist_max', 2.0)
+        self.turning_dist_min = config.get('turning_dist_min', 0.4)
+        self.turning_dist_max = config.get('turning_dist_max', 3.0)
+
+        # adaptive cruising speed (item 10) - scales speed down as sensed
+        # clearance shrinks, within [min_speed, max_speed]. Feeds the
+        # distance formula above via _last_commanded_speed, closing the
+        # loop: tight space -> slower speed -> smaller stop/turning
+        # distance, open space -> faster -> larger distance - one
+        # mechanism instead of separate "cramped" vs "outdoor" profiles.
+        self.adaptive_speed = config.get('adaptive_speed', True)
+        self.min_speed = config.get('min_speed', 0.15)
+        self.speed_clearance_ceiling = config.get('speed_clearance_ceiling', 3.0)
+        self._last_commanded_speed = 0.0
+        self._last_commanded_steering = 0.0
 
         # heading hold after clearing an obstacle
         self.realign_gain = config.get('realign_gain', 1.5)
@@ -423,6 +554,7 @@ class TulakObstacle(Node):
         self.escape_backup_time_boost = config.get('escape_backup_time_boost', 1.5)
 
         # ground-hazard (drop-off / staircase) reaction (see notes at top of file)
+        self.enable_ground_hazard = config.get('enable_ground_hazard', True)  # <-- on/off switch
         self.ground_hazard_confirm_frames = config.get('ground_hazard_confirm_frames', 3)
         self.terminate_on_ground_hazard = config.get('terminate_on_ground_hazard', True)
         self.ground_hazard_streak = 0
@@ -463,6 +595,7 @@ class TulakObstacle(Node):
         self.right_dist = None
         self.stop_streak = 0
         self.turn_streak = 0
+        self.depth_profile = []  # free_space_bins distances - see on_depth_profile/_free_space_steering
         # the OAK pipeline takes several seconds to boot, during which
         # last_obstacle/left_dist/right_dist above still hold their
         # "assume clear" init values - stay stopped in on_pose2d until the
@@ -474,6 +607,17 @@ class TulakObstacle(Node):
         self.last_dir = 0  # steering angle (rad), from nn_mask
         self.left_road_frac = 0.5
         self.right_road_frac = 0.5
+
+        # free-space steering (item 11 at top of file) - continuous
+        # depth-based centering nudge, blended with last_dir above,
+        # meant to keep the robot away from a tightening side well
+        # before turning_dist would trigger the discrete avoidance state
+        # machine, so a narrow driveway doesn't need the big backup+turn
+        # maneuver just to stay roughly centered.
+        self.free_space_weight = config.get('free_space_weight', 0.5)
+        self.free_space_lead_margin = config.get('free_space_lead_margin', 1.3)
+        rate_deg_s = config.get('max_steering_rate_deg_s', 60)
+        self.max_steering_rate = math.radians(rate_deg_s) if rate_deg_s and rate_deg_s > 0 else None
 
         # heading - prefer IMU 'rotation' over odometry-derived pose2d
         # heading if the platform ever sends it
@@ -690,12 +834,17 @@ class TulakObstacle(Node):
 
         self.turn_streak = self.turn_streak + 1 if is_blocked else 0
 
+    def on_depth_profile(self, data):
+        self.depth_profile = data
+
     def on_ground_hazard(self, data):
         """data is [hazard_bool, ground_valid_frac, ground_dist] for this
         frame from ObstacleDetector3DZones - the streak/debounce logic
         lives here, same pattern as stop_streak/turn_streak above, rather
         than in the sensing module. valid_frac/dist are only for
         diagnostics/logging, not part of the trigger decision itself."""
+        if not self.enable_ground_hazard:
+            return  # ObstacleDetector3DZones still computes/publishes it - just ignored here
         hazard, valid_frac, dist = data
         self.ground_hazard_streak = self.ground_hazard_streak + 1 if hazard else 0
 
@@ -794,22 +943,127 @@ class TulakObstacle(Node):
         best_heading, *_ = max(self.scan_samples, key=score)
         return best_heading
 
-    def _drive_steering(self):
+    def _free_space_steering(self):
+        """Continuous depth-based centering nudge from depth_profile
+        (item 11 at top of file) - aim toward whichever bins have the
+        most clearance beyond a threshold derived from the CURRENT (and,
+        with adaptive_distances on, currently speed-scaled) turning_dist,
+        weighted by how much clearance beyond that threshold they have.
+        Bins at/under the threshold contribute nothing (weight 0), never
+        a pull AWAY from anything - this only ever nudges toward openness,
+        it doesn't invent a direction when everything's tight (that's the
+        discrete avoidance state machine's job, not this one). Returns
+        0.0 if there's no profile yet, or nothing beyond the threshold
+        anywhere (that situation is exactly what turning_dist/turn_streak
+        is for)."""
+        if not self.depth_profile:
+            return 0.0
+        free_space_min_dist = self.turning_dist * self.free_space_lead_margin
+        n = len(self.depth_profile)
+        total_weight = 0.0
+        weighted_pos = 0.0
+        for i, d in enumerate(self.depth_profile):
+            if d is None or d <= free_space_min_dist:
+                continue
+            pos = (i + 0.5) / n * 2 - 1  # bin centre, -1 (left edge) .. +1 (right edge)
+            weight = d - free_space_min_dist
+            total_weight += weight
+            weighted_pos += weight * pos
+        if total_weight <= 0:
+            return 0.0
+        aim = weighted_pos / total_weight
+        # same sign convention as on_nn_mask's last_dir: aim>0 (open bins
+        # skew right) should steer right
+        return -math.copysign(min(1.0, abs(aim)) * self.turn_angle, aim)
+
+    def _adaptive_speed(self):
+        """Cruising speed scaled by currently sensed clearance, within
+        [min_speed, max_speed] (item 10 at top of file). max_speed
+        outright if adaptive_speed is off."""
+        if not self.adaptive_speed:
+            return self.max_speed
+        l_dist = self.left_dist if self.left_dist is not None else float('inf')
+        r_dist = self.right_dist if self.right_dist is not None else float('inf')
+        clearance = min(self.last_obstacle, l_dist, r_dist, self.speed_clearance_ceiling)
+        frac = clearance / self.speed_clearance_ceiling if self.speed_clearance_ceiling > 0 else 1.0
+        return max(self.min_speed, min(self.max_speed, self.min_speed + frac * (self.max_speed - self.min_speed)))
+
+    def _update_adaptive_distances(self):
+        """Recomputes stop_dist/turning_dist from the robot's actual last
+        COMMANDED speed (item 10) - called once near the top of
+        on_pose2d, every cycle. Deliberately uses _last_commanded_speed,
+        not self.max_speed or _adaptive_speed()'s output for this cycle:
+        that means stop_dist correctly shrinks while BACKING_UP/TURNING
+        (which move slower than cruising) instead of staying pinned to
+        cruising-speed math while already moving cautiously. Only a
+        rough, uncalibrated model (see decel_mps2 in __init__) - the
+        stop_dist_min/max and turning_dist_min/max bounds are the actual
+        safety net if the formula ever produces something unreasonable
+        for your platform."""
+        if not self.adaptive_distances:
+            return
+        v = abs(self._last_commanded_speed)
+        reaction_sec = self.close_confirm_frames / self.depth_fps + self.reaction_margin_sec
+        stop = v * reaction_sec + v ** 2 / (2 * self.decel_mps2) + self.stop_dist_margin_m
+        stop = max(self.stop_dist_min, min(self.stop_dist_max, stop))
+        turning = stop + v * self.turning_lead_sec
+        turning = max(self.turning_dist_min, min(self.turning_dist_max, turning))
+        self.stop_dist, self.turning_dist = stop, turning
+
+    def _rate_limit_steering(self, target, dt):
+        """Caps how fast _drive_steering()'s output can change, so normal
+        cruising doesn't snap between corrections (item 11) - deliberately
+        NOT applied to the avoidance state machine's own steering, which
+        needs to be able to commit decisively. Baseline is
+        _last_commanded_steering, updated once per cycle in on_pose2d
+        regardless of which state produced it, so this stays continuous
+        across a DRIVE <-> avoidance transition instead of jumping from a
+        stale value. max_steering_rate=None (max_steering_rate_deg_s<=0)
+        disables this outright, same as dt=None (used by _gps_status_line's
+        diagnostic-only call - a status line showing a rate-limited value
+        would misleadingly suggest the limiting already happened)."""
+        if self.max_steering_rate is None or dt is None:
+            return target
+        max_delta = self.max_steering_rate * dt.total_seconds()
+        delta = max(-max_delta, min(max_delta, target - self._last_commanded_steering))
+        return self._last_commanded_steering + delta
+
+    def _drive_steering(self, dt=None):
         """Steering to use when NOT actively avoiding an obstacle - i.e.
         this only ever runs from a context where obstacle avoidance has
         already had first say (it is highest priority: it fully overrides
-        this method's result by never calling it while avoiding). Within
-        that, drivable-area (last_dir, from the road mask) still wins over
-        the GPS bearing whenever the mask shows little/no road on the side
-        the bearing wants: bearing_blend_road_frac is the road-fraction
-        (see on_nn_mask - the theoretical max is ~0.5 since the always-
-        masked-out sky half counts toward the mean) at which the bearing
-        gets full trust; below that it's scaled down proportionally, pure
-        road-following at 0. This is a first-pass heuristic, not field
-        tuned - watch left_road_frac/right_road_frac against turn_streak
-        false positives once you can test outside."""
+        this method's result by never calling it while avoiding). Three
+        signals blend together, in order:
+
+        1. last_dir (road mask, appearance-based "is this drivable") and
+           _free_space_steering() (depth-based, "is this open") combine
+           via free_space_weight into local_dir - together these are the
+           answer to "pick the smoothest path that's also marked
+           drivable": smoothness/openness from depth, drivable-marking
+           from the road mask, blended rather than either one alone
+           deciding. This intentionally does NOT live in the avoidance
+           state machine - it's a continuous control question ("how
+           should ordinary cruising lean"), not a discrete one ("has
+           something forced an unavoidable maneuver") - the state machine
+           still owns exactly the latter, unchanged.
+        2. GPS bearing still wins over local_dir whenever the mask shows
+           little/no road on the side the bearing wants: bearing_blend_
+           road_frac is the road-fraction (see on_nn_mask - the
+           theoretical max is ~0.5 since the always-masked-out sky half
+           counts toward the mean) at which the bearing gets full trust;
+           below that it's scaled down proportionally, pure local_dir at
+           0. This is a first-pass heuristic, not field tuned - watch
+           left_road_frac/right_road_frac against turn_streak false
+           positives once you can test outside.
+        3. The final result is rate-limited (_rate_limit_steering) so
+           ordinary driving doesn't snap between corrections - this step
+           only, never the avoidance maneuvers themselves."""
+        local_dir = self.last_dir
+        if self.free_space_weight > 0:
+            local_dir = (1 - self.free_space_weight) * local_dir + self.free_space_weight * self._free_space_steering()
+
         if not self.follow_gps_target or self.bearing_to_target is None or self.travel_heading is None:
-            return self.last_dir  # no usable GPS heading yet - pure road following
+            return self._rate_limit_steering(local_dir, dt)  # no usable GPS heading yet
 
         error = normalize_angle(self.travel_heading - self.bearing_to_target)
         bearing_steering = max(-self.turn_angle, min(self.turn_angle, error))
@@ -819,7 +1073,7 @@ class TulakObstacle(Node):
             weight = min(1.0, road_frac_that_way / self.bearing_blend_road_frac)
         else:
             weight = 1.0
-        return (1 - weight) * self.last_dir + weight * bearing_steering
+        return self._rate_limit_steering((1 - weight) * local_dir + weight * bearing_steering, dt)
 
     def _following_status(self):
         """Human-readable reason why GPS bearing-following is or isn't
@@ -938,6 +1192,11 @@ class TulakObstacle(Node):
         dt = (self.time - self._last_cycle_time) if self._last_cycle_time is not None else datetime.timedelta(0)
         self._last_cycle_time = self.time
 
+        # recompute stop_dist/turning_dist from the actual last-commanded
+        # speed before anything below reads them this cycle - see item 10
+        # at top of file and _update_adaptive_distances
+        self._update_adaptive_distances()
+
         if not self.have_obstacle_data:
             # camera pipeline still booting (OAK-D Pro typically takes a
             # few seconds) - pose2d already flows from the platform at
@@ -1021,11 +1280,11 @@ class TulakObstacle(Node):
             if abs(error) < self.realign_tolerance or elapsed > self.max_realign_time:
                 print(self.time, 'realigned, resuming road following')
                 self._enter_drive()
-                speed, steering_angle = self.max_speed, self._drive_steering()
+                speed, steering_angle = self._adaptive_speed(), self._drive_steering(dt)
             else:
                 steering_angle = max(-self.realign_max_steering,
                                      min(self.realign_max_steering, error * self.realign_gain))
-                speed = self.max_speed
+                speed = self._adaptive_speed()
 
         elif is_emergency or (not self.avoid_obstacles and self.stop_streak >= self.close_confirm_frames):
             if self.avoid_obstacles:
@@ -1051,7 +1310,7 @@ class TulakObstacle(Node):
             speed, steering_angle = 0, 0
 
         else:
-            speed, steering_angle = self.max_speed, self._drive_steering()
+            speed, steering_angle = self._adaptive_speed(), self._drive_steering(dt)
 
         # record forward-driving steering history for a future retrace
         # backup (see _enter_backing_up/_next_retrace_steering) - only
@@ -1063,6 +1322,13 @@ class TulakObstacle(Node):
             while self.path_history_total > self.retrace_buffer_sec and len(self.path_history) > 1:
                 _, old_dt = self.path_history.popleft()
                 self.path_history_total -= old_dt
+
+        # single source of truth for "what did we actually just command" -
+        # read back by _update_adaptive_distances (speed) and
+        # _rate_limit_steering (steering) next cycle, regardless of which
+        # state produced this cycle's values
+        self._last_commanded_speed = speed
+        self._last_commanded_steering = steering_angle
 
         if self.verbose:
             print(self.time, self.state, speed, steering_angle, self.last_obstacle,
