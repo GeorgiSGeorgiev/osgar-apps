@@ -12,7 +12,7 @@
           "init": {
             "max_speed": 0.5,
             "stop_dist": 0.6,
-            "turning_dist": 0.90,
+            "turning_dist": 0.80,
             "close_confirm_frames": 5,
             "min_turn_time_sec": 0.1,
             "max_turn_time_sec": 8.0,
@@ -25,10 +25,16 @@
             "ground_hazard_confirm_frames": 3,
             "terminate_on_ground_hazard": false,
             "follow_gps_target": true,
-            "gps_heading_min_baseline_m": 1.0,
+            "gps_heading_min_baseline_m": 5.0,
+            "gps_heading_smoothing_alpha": 0.4,
             "waypoint_arrival_dist_m": 3.0,
             "bearing_blend_road_frac": 0.3,
-            "gps_log_interval_sec": 2.0
+            "gps_log_interval_sec": 2.0,
+            "retrace_buffer_sec": 12.0,
+            "scan_min_sweep_deg": 30,
+            "scan_confident_margin": 1.5,
+            "side_zone_weight": 0.5,
+            "bearing_penalty_weight": 0.4
           }
       },
       "platform": {
@@ -79,7 +85,7 @@
           "sipp_buffer_size": 0,
           "stereo_median_filter": "KERNEL_5x5",
           "depth_profile": "ROBOTICS",
-          "stereo_confidence_threshold": 60,
+          "stereo_confidence_threshold": 30,
           "stereo_speckle_filter": false,
           "stereo_speckle_range": 50,
           "stereo_spatial_filter": false,
@@ -121,7 +127,7 @@
             "min_shift_change_px": 12,
             "camera_tilt_deg": 7.5,
             "rows": [175, 260],
-            "center_cols": [270, 370],
+            "center_cols": [260, 380],
             "left_cols": [60, 220],
             "right_cols": [420, 580],
             "ground_rows": [350, 395],

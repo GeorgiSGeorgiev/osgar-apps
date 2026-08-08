@@ -155,20 +155,147 @@
      left_road_frac/right_road_frac/bearing_to_target via verbose
      logging before trusting it to actually leave the road.
 
+  6. Retrace-based backing up + scan-based turning commit. Two changes
+     to the avoidance maneuver itself, both prompted by field footage
+     (tall grass: center zone pinned at the 0.0 fail-safe from too few
+     valid depth pixels - see obstdet3d_zones.py - sides reading
+     None/"clear" from lack of data rather than confirmed openness)
+     that showed the previous version committing to a direction after
+     a single momentarily-clear frame, then driving straight back into
+     the same patch it had just backed away from.
+
+     Backing up now retraces the path just driven, instead of backing
+     up straight/at a fixed angle: on_pose2d logs (steering_angle,
+     duration) for every forward-driving cycle into a bounded
+     self.path_history buffer (retrace_buffer_sec worth of it), and a
+     fresh (non-emergency-abort) entry into BACKING_UP snapshots that
+     history reversed into self.retrace_queue, replaying it - same
+     steering sign, reverse chronological order, negated speed - via
+     _next_retrace_steering(). Physically this retraces the same curve
+     the robot just drove: for a fixed front-steering vehicle, holding
+     the same steering angle while reversing traces the same arc
+     backward (the everyday "back out along your own tracks" maneuver -
+     curvature is dtheta/ds = tan(steering)/wheelbase, a property of the
+     steering angle alone, independent of which way the wheels are
+     turning). This is the highest-confidence direction available: it's
+     ground the robot has already just proven it can cross. Once the
+     buffer runs out it falls back to backing up straight, same as
+     before. The emergency-abort path (something dangerously close
+     RIGHT NOW - see the centralized safety check in on_pose2d) keeps
+     the old fixed-angle behaviour on purpose - there's no time/margin
+     to be clever about replaying history there, and mid-avoidance the
+     recent history may not even be "the way in" anymore.
+
+     Turning now scans before committing to a heading, instead of
+     exiting the instant turn_streak flickers back to 0 - which could
+     be a single non-blocked frame, since there's confirm-frame
+     debounce going INTO "blocked" (close_confirm_frames) but none
+     coming back out of it. While TURNING, every cycle appends
+     (heading, center, left, right) to self.scan_samples; the state now
+     requires sweeping at least scan_min_sweep_deg of real heading
+     change (from IMU-derived last_heading, not wheel odometry - it
+     shouldn't be fooled by the same wheel-slip-in-grass that can
+     confuse the escape-mode progress check) before it's allowed to
+     stop turning, and on exit picks the best-scoring recorded heading
+     instead of "wherever we happened to be pointed when a flicker
+     cleared." Score is center distance plus side_zone_weight times
+     whichever of left/right is smaller (both zones are field-
+     calibrated now, worth actually weighing in rather than only using
+     as a clear/unclear tiebreak); a small bearing_penalty_weight
+     additionally favors headings closer to bearing_to_target when a
+     GPS target is set - converted into the same compass convention as
+     bearing_to_target via a heading_frame_offset captured once per
+     avoidance cycle first (last_heading has no known relationship to
+     true north either, same caveat as section 5's _drive_steering -
+     comparing it to bearing_to_target directly would silently steer
+     toward some rotated-by-an-unknown-amount heading) - but only
+     enough to break ties between comparable gaps, not to override a
+     clearer one - obstacle
+     avoidance still fully overrides GPS per the priority order in
+     section 5 above, this only nudges which of several acceptable
+     gaps gets picked.
+
+     This also lets escape mode drop its old special case ("accept
+     whatever heading we're at instead of realigning, because
+     saved_heading is probably the dead end we're trying to leave").
+     saved_heading is repurposed here as REALIGNING's target heading in
+     general, not just "the original pre-avoidance heading" - TURNING
+     overwrites it with the scanned best_heading before handing off, in
+     or out of escape mode. Since that target now comes from evidence
+     gathered during the sweep, it isn't the dead end by construction,
+     so there's nothing left to avoid fighting to return to.
+
+  7. Bug fix: stop_streak (drives is_emergency, the hard-stop safety net
+     that's supposed to abort TURNING/REALIGNING and start backing up
+     regardless of what state-specific logic is doing) was computed from
+     `center` alone, even though stop_dist is documented above as an
+     always-applies hard stop. Caught from field footage: TURNING drives
+     forward for its whole duration by design, and can clip a wall on
+     either side - not dead ahead - well before center ever reads close;
+     with no side check, that never registered as an emergency no matter
+     how close it got. Now stop_now (feeding stop_streak) checks center
+     OR either side against stop_dist, same None-is-far-not-clear
+     handling as the existing turning_dist check just below it. This
+     also caps how long the new scan-based TURNING sweep (item 6) can
+     spend driving forward into a tightening corner before something
+     stops it, regardless of scan_min_sweep_deg.
+
+  8. Confident early exit from the TURNING sweep (item 6). Field-tested:
+     forcing the full scan_min_sweep_deg every time made ordinary,
+     unambiguous avoidance (a single obstacle with clearly open road on
+     one side) feel like it "held the turn too long" - it kept sweeping
+     to compare options even when the very first direction tried was
+     already obviously fine. The full sweep is what actually helps in
+     the ambiguous case (tall grass, nothing reads clearly open) - it
+     was never needed for the easy case. Now each TURNING cycle also
+     checks whether the CURRENT heading alone is confidently clear
+     (center AND both sides at least scan_confident_margin times
+     turning_dist - comfortably past the threshold, not barely over it),
+     debounced by close_confirm_frames so one lucky frame still can't
+     trigger it (the exact failure mode item 6 fixed in the first
+     place). If so, it commits right away instead of grinding through
+     the rest of the sweep; otherwise scan_min_sweep_deg still applies
+     as before.
+
+  9. Bug fix: GPS heading (travel_heading) was mostly noise at the
+     original gps_heading_min_baseline_m=1.0, field-confirmed by an
+     S-curve in open ground with nothing else in play (obstacle
+     avoidance untouched by this item - turn_streak/stop_streak were 0
+     the whole time). Two consecutive GPS fixes ~1.45m apart (just past
+     the old 1.0m baseline) produced travel_heading readings 219 degrees
+     apart in 3 seconds while driving a straight line - physically
+     impossible, i.e. that baseline distance is not long enough for
+     ordinary consumer-GPS fix-to-fix jitter (the module docstring
+     already warned "easily 1-5m") to average out against a real bearing.
+     bearing_to_target itself is unaffected (it's computed against a
+     target far away, so a couple meters of fix noise barely moves it) -
+     only travel_heading, computed over the much shorter distance between
+     successive fixes, was the problem. Two independent mitigations, both
+     scoped to GPS code only: gps_heading_min_baseline_m's default is now
+     5.0 (still just a more conservative starting point, not calibrated
+     for your receiver - re-tune from real fix-to-fix scatter if you have
+     it), and travel_heading is now smoothed across updates with a
+     circular EMA (gps_heading_smoothing_alpha, see _smooth_heading) -
+     same idea as the pitch smoothing in obstdet3d_zones.py, just over
+     wrap-around angles this time, so a plain linear EMA would be wrong.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
   gps_heading_min_baseline_m, waypoint_arrival_dist_m,
-  bearing_blend_road_frac) have defaults, so existing JSON keeps working
-  unchanged except for wiring the new ground_hazard/qr_code/nmea_data
-  inputs (see the updated config file). stop_dist/turning_dist/
-  close_confirm_frames behaviour is untouched. Bench-test before
-  trusting this outdoors - it has not been run against the real osgar
-  harness/hardware.
+  bearing_blend_road_frac, retrace_buffer_sec, scan_min_sweep_deg,
+  scan_confident_margin, side_zone_weight, bearing_penalty_weight,
+  gps_heading_smoothing_alpha) have defaults, so existing
+  JSON keeps working unchanged except for wiring the new ground_hazard/
+  qr_code/nmea_data inputs (see the updated config file). stop_dist/
+  turning_dist/close_confirm_frames behaviour is untouched. Bench-test
+  before trusting this outdoors - it has not been run against the real
+  osgar harness/hardware.
 """
 import datetime
 import math
 import re
+from collections import deque
 from enum import Enum
 
 import numpy as np
@@ -306,7 +433,18 @@ class TulakObstacle(Node):
         # consecutive GPS fixes (NOT from IMU 'rotation' - deliberately;
         # see docstring)
         self.follow_gps_target = config.get('follow_gps_target', True)  # <-- on/off switch
-        self.gps_heading_min_baseline_m = config.get('gps_heading_min_baseline_m', 1.0)
+        # field-tested (see item 9 at top of file): 1.0m let ordinary GPS
+        # jitter alone cross the baseline and get read as real motion,
+        # producing a travel_heading that swung 200+ degrees in a few
+        # seconds while driving straight. 5.0m is a more conservative
+        # starting point, not a calibrated value for your receiver either.
+        self.gps_heading_min_baseline_m = config.get('gps_heading_min_baseline_m', 5.0)
+        # circular EMA (heading wraps at 2pi, a plain linear EMA would be
+        # wrong near the wrap) applied to travel_heading across successive
+        # baseline-gated updates - a second layer of noise rejection on
+        # top of the baseline distance itself, same spirit as the pitch
+        # smoothing in obstdet3d_zones.py. 1.0 = no smoothing.
+        self.gps_heading_smoothing_alpha = config.get('gps_heading_smoothing_alpha', 0.4)
         self.waypoint_arrival_dist_m = config.get('waypoint_arrival_dist_m', 3.0)
         self.bearing_blend_road_frac = config.get('bearing_blend_road_frac', 0.3)
         self.gps_log_interval = datetime.timedelta(seconds=config.get('gps_log_interval_sec', 2.0))
@@ -349,6 +487,37 @@ class TulakObstacle(Node):
         self.state_start_time = None
         self.current_backup_steering = 0
         self.turn_sign = 1  # +1 = left, -1 = right
+
+        # retrace-based backing up (see notes at top of file) - replay
+        # the recent forward-driving steering history in reverse when
+        # backing away from an obstacle, instead of backing up straight/
+        # at a fixed angle
+        self.retrace_buffer_sec = datetime.timedelta(
+            seconds=config.get('retrace_buffer_sec', 12.0))
+        self.path_history = deque()  # (steering_angle, duration), oldest first, forward-driving cycles only
+        self.path_history_total = datetime.timedelta(0)
+        self.retrace_queue = deque()  # snapshotted from path_history when a retrace backup starts
+        self._last_cycle_time = None  # for per-cycle dt - see on_pose2d
+
+        # scan-based turning commit (see notes at top of file) - sweep a
+        # minimum angle and pick the best heading seen, instead of
+        # grabbing the first momentarily-clear frame
+        self.scan_min_sweep = math.radians(config.get('scan_min_sweep_deg', 50))
+        self.side_zone_weight = config.get('side_zone_weight', 0.5)
+        self.bearing_penalty_weight = config.get('bearing_penalty_weight', 0.4)
+        # early-exit: don't force the full scan_min_sweep when the very
+        # first direction tried is already obviously open - only when
+        # nothing looks confidently clear (the tall-grass case, where the
+        # full sweep-and-compare is actually needed)
+        self.scan_confident_dist = self.turning_dist * config.get('scan_confident_margin', 1.5)
+        self.scan_confident_streak = 0
+        self.scan_samples = []  # (heading, center, left, right), recorded during TURNING
+        self.scan_start_heading = None
+        # last_heading (IMU) <-> bearing_to_target (compass) frame offset,
+        # captured once per avoidance cycle - see _start_avoidance_cycle
+        # and _best_scan_heading for why this can't compare the two
+        # directly (same caveat _drive_steering already documents)
+        self.heading_frame_offset = None
 
         # escape-mode bookkeeping
         self.escape_counter = 0
@@ -428,6 +597,19 @@ class TulakObstacle(Node):
         else:
             print(self.time, 'GPS: no fix yet, own position unknown')
 
+    def _smooth_heading(self, new_heading):
+        """Circular EMA - travel_heading wraps at +-pi, so a plain linear
+        EMA would be wrong right around the wrap (e.g. blending 179deg and
+        -179deg should stay near +-180, not average to 0). Blend as unit
+        vectors instead and convert back. gps_heading_smoothing_alpha=1.0
+        makes this a no-op (always the latest reading, old behaviour)."""
+        if self.travel_heading is None:
+            return new_heading
+        alpha = self.gps_heading_smoothing_alpha
+        x = (1 - alpha) * math.cos(self.travel_heading) + alpha * math.cos(new_heading)
+        y = (1 - alpha) * math.sin(self.travel_heading) + alpha * math.sin(new_heading)
+        return math.atan2(y, x)
+
     def on_nmea_data(self, data):
         lat, lon = data.get('lat'), data.get('lon')
         if lat is not None and lon is not None:
@@ -443,8 +625,11 @@ class TulakObstacle(Node):
                     # only advance the heading baseline once we've moved far
                     # enough for the bearing between fixes to be meaningful -
                     # plain GPS noise alone (no RTK) is easily 1-5m, a shorter
-                    # baseline would make travel_heading mostly noise
-                    self.travel_heading = initial_bearing(*self.last_gps_pos, lat, lon)
+                    # baseline would make travel_heading mostly noise - and
+                    # even at the baseline distance, smooth across updates
+                    # rather than snapping fully to each new one (see
+                    # _smooth_heading and item 9 at top of file)
+                    self.travel_heading = self._smooth_heading(initial_bearing(*self.last_gps_pos, lat, lon))
                     self.last_gps_pos = (lat, lon)
             else:
                 self.last_gps_pos = (lat, lon)
@@ -485,10 +670,20 @@ class TulakObstacle(Node):
         self.left_dist = left
         self.right_dist = right
 
-        self.stop_streak = self.stop_streak + 1 if center < self.stop_dist else 0
         # Treat None as infinitely far away so it doesn't trigger false positives
         l_dist = left if left is not None else float('inf')
         r_dist = right if right is not None else float('inf')
+
+        # stop_dist is the hard-stop distance and is documented ("always
+        # applies") as an absolute safety net regardless of state - center
+        # alone isn't enough for that: while TURNING the robot drives
+        # forward and can clip a wall on either side well before center
+        # ever reads close, exactly like this. None (untrusted/no data) on
+        # a side must NOT suppress this check - only a genuinely far
+        # reading should - hence l_dist/r_dist (inf for None), not the
+        # raw left/right, here too.
+        stop_now = center < self.stop_dist or l_dist < self.stop_dist or r_dist < self.stop_dist
+        self.stop_streak = self.stop_streak + 1 if stop_now else 0
 
         # The robot is only "clear" if the center AND both sides are further than turning_dist
         is_blocked = (center < self.turning_dist) or (l_dist < self.turning_dist) or (r_dist < self.turning_dist)
@@ -566,6 +761,39 @@ class TulakObstacle(Node):
         right = self.right_dist if self.right_dist is not None else float('inf')
         return 1 if left >= right else -1
 
+    def _best_scan_heading(self):
+        """Pick the best-scoring heading recorded in scan_samples during
+        the just-finished TURNING sweep. Score is center clearance plus
+        side_zone_weight times whichever of left/right is smaller at that
+        heading (both zones are field-calibrated now, so worth actually
+        weighing in), plus - if a GPS target is set and heading_frame_offset
+        is known - a small pull from bearing_penalty_weight toward headings
+        closer to bearing_to_target (converted into the same compass
+        convention via heading_frame_offset first - see
+        _start_avoidance_cycle), only enough to break ties between
+        comparable gaps, not to override a clearer one. Falls back to
+        saved_heading (the pre-avoidance heading) if the sweep produced no
+        samples at all."""
+        if not self.scan_samples:
+            return self.saved_heading
+
+        def score(sample):
+            heading, center, left, right = sample
+            sides = [d for d in (left, right) if d is not None]
+            side_component = min(sides) if sides else 0.0
+            s = center + self.side_zone_weight * side_component
+            if self.bearing_to_target is not None and self.heading_frame_offset is not None:
+                # convert this sample's IMU heading into the same
+                # (compass) convention as bearing_to_target before
+                # comparing - see heading_frame_offset
+                heading_as_bearing = normalize_angle(heading + self.heading_frame_offset)
+                angle_diff = abs(normalize_angle(heading_as_bearing - self.bearing_to_target))
+                s -= self.bearing_penalty_weight * angle_diff
+            return s
+
+        best_heading, *_ = max(self.scan_samples, key=score)
+        return best_heading
+
     def _drive_steering(self):
         """Steering to use when NOT actively avoiding an obstacle - i.e.
         this only ever runs from a context where obstacle avoidance has
@@ -626,10 +854,31 @@ class TulakObstacle(Node):
         parts.append('(%s)' % self._following_status())
         return ' '.join(parts)
 
-    def _enter_backing_up(self, steering):
+    def _enter_backing_up(self, steering, use_retrace=False):
+        """steering is the fallback angle used once the retrace queue (if
+        any) runs out - or always, when use_retrace=False, which the
+        emergency-abort call site deliberately keeps: something is
+        dangerously close right now, this is not the moment to be clever
+        about replaying history."""
         self.state = State.BACKING_UP
         self.state_start_time = self.time
         self.current_backup_steering = steering
+        self.retrace_queue = deque(reversed(self.path_history)) if use_retrace else deque()
+
+    def _next_retrace_steering(self, dt):
+        """Pop (steering_angle, remaining_duration) entries off the front
+        of retrace_queue - most-recent-forward-step first - consuming dt
+        of "replay time" per call. Falls back to current_backup_steering
+        once the queue is exhausted (or was never populated - see
+        _enter_backing_up's use_retrace)."""
+        while self.retrace_queue:
+            steering_angle, remaining = self.retrace_queue[0]
+            if remaining > dt:
+                self.retrace_queue[0] = (steering_angle, remaining - dt)
+                return steering_angle
+            self.retrace_queue.popleft()
+            dt -= remaining
+        return self.current_backup_steering
 
     def _enter_turning(self):
         self.state = State.TURNING
@@ -638,6 +887,9 @@ class TulakObstacle(Node):
             self.turn_sign = -self.turn_sign  # deliberately try the other side
         else:
             self.turn_sign = self._choose_turn_sign()
+        self.scan_samples = []
+        self.scan_start_heading = self.last_heading
+        self.scan_confident_streak = 0
 
     def _enter_drive(self):
         self.state = State.DRIVE
@@ -652,6 +904,18 @@ class TulakObstacle(Node):
         if self.saved_heading is not None:
             return  # already mid-cycle
         self.saved_heading = self.last_heading
+        # last_heading (IMU yaw) has no known fixed relationship to true
+        # north - see _drive_steering()'s docstring - but it should still
+        # be trustworthy as a RELATIVE measure over the short span of one
+        # avoidance cycle. Capture the offset between it and the compass-
+        # referenced travel_heading now, while both are known for the
+        # same instant, so _best_scan_heading can later convert a scanned
+        # last_heading into the SAME (compass) convention as
+        # bearing_to_target instead of comparing the two conventions
+        # directly.
+        self.heading_frame_offset = (
+            normalize_angle(self.travel_heading - self.saved_heading)
+            if self.travel_heading is not None else None)
         if self.progress_anchor_xy is not None:
             dist = math.hypot(xy[0] - self.progress_anchor_xy[0],
                               xy[1] - self.progress_anchor_xy[1])
@@ -668,6 +932,11 @@ class TulakObstacle(Node):
         xy = (x_mm / 1000.0, y_mm / 1000.0)
         if not self.have_imu_heading:
             self.last_heading = math.radians(heading_cdeg / 100.0)
+
+        # per-cycle dt, used both to replay path_history (BACKING_UP) and
+        # to record it (forward driving) - see notes at top of file
+        dt = (self.time - self._last_cycle_time) if self._last_cycle_time is not None else datetime.timedelta(0)
+        self._last_cycle_time = self.time
 
         if not self.have_obstacle_data:
             # camera pipeline still booting (OAK-D Pro typically takes a
@@ -700,7 +969,7 @@ class TulakObstacle(Node):
 
         # --- STATE MACHINE ---
         if self.avoid_obstacles and self.state == State.BACKING_UP:
-            speed, steering_angle = -self.backup_speed, self.current_backup_steering
+            speed, steering_angle = -self.backup_speed, self._next_retrace_steering(dt)
             elapsed = self.time - self.state_start_time
             boost = self.escape_backup_time_boost if self.in_escape_mode else 1.0
             min_bt, max_bt = self.min_backup_time * boost, self.max_backup_time * boost
@@ -715,21 +984,36 @@ class TulakObstacle(Node):
         elif self.avoid_obstacles and self.state == State.TURNING:
             speed, steering_angle = self.avoid_speed, self.turn_sign * self.avoid_steering
             elapsed = self.time - self.state_start_time
-            if (elapsed > self.min_turn_time and self.turn_streak == 0) or elapsed > self.max_turn_time:
-                if elapsed > self.max_turn_time and self.turn_streak != 0:
-                    print(self.time, 'giving up waiting to clear, realigning anyway')
-                else:
-                    print(self.time, 'stop turning, realigning to', round(math.degrees(self.saved_heading)))
-                if self.in_escape_mode:
-                    # saved_heading is often exactly what's pointed at the
-                    # dead end - accept the new heading instead of
-                    # fighting to return to it
-                    print(self.time, 'escape mode: accepting new heading instead of realigning')
-                    self._enter_drive()
-                    speed, steering_angle = self.max_speed, self._drive_steering()
-                else:
-                    self.state = State.REALIGNING
-                    self.state_start_time = self.time
+            self.scan_samples.append((self.last_heading, self.last_obstacle, self.left_dist, self.right_dist))
+            swept = abs(normalize_angle(self.last_heading - self.scan_start_heading))
+
+            # confident early exit: if THIS heading is already comfortably
+            # clear on all three zones (not just barely past turning_dist),
+            # don't force grinding through the rest of scan_min_sweep to
+            # "prove" it - debounced (close_confirm_frames) so one lucky
+            # frame can't trigger it, same guard as the bug this replaced
+            l_dist = self.left_dist if self.left_dist is not None else float('inf')
+            r_dist = self.right_dist if self.right_dist is not None else float('inf')
+            confident_clear = (self.last_obstacle >= self.scan_confident_dist
+                                and l_dist >= self.scan_confident_dist
+                                and r_dist >= self.scan_confident_dist)
+            self.scan_confident_streak = self.scan_confident_streak + 1 if confident_clear else 0
+
+            enough_sweep = swept >= self.scan_min_sweep
+            confident_enough = self.scan_confident_streak >= self.close_confirm_frames
+            if (elapsed > self.min_turn_time and (enough_sweep or confident_enough)) or elapsed > self.max_turn_time:
+                if elapsed > self.max_turn_time and not (enough_sweep or confident_enough):
+                    print(self.time, 'giving up waiting to sweep enough, committing to best heading seen so far')
+                elif confident_enough and not enough_sweep:
+                    print(self.time, 'clearly open ahead, committing early without a full sweep')
+                best_heading = self._best_scan_heading()
+                print(self.time, 'stop turning, realigning to best scanned heading', round(math.degrees(best_heading)))
+                # saved_heading now doubles as "REALIGNING's target" - see
+                # notes at top of file for why this also removes the old
+                # escape-mode special case that used to skip realigning
+                self.saved_heading = best_heading
+                self.state = State.REALIGNING
+                self.state_start_time = self.time
 
         elif self.avoid_obstacles and self.state == State.REALIGNING:
             error = normalize_angle(self.saved_heading - self.last_heading)
@@ -745,19 +1029,19 @@ class TulakObstacle(Node):
 
         elif is_emergency or (not self.avoid_obstacles and self.stop_streak >= self.close_confirm_frames):
             if self.avoid_obstacles:
-                print(self.time, 'obstacle too close, backing up', self.last_obstacle)
+                print(self.time, 'obstacle too close, backing up (retracing path)', self.last_obstacle)
                 self._start_avoidance_cycle(xy)
-                self._enter_backing_up(0)
-                speed, steering_angle = -self.backup_speed, 0
+                self._enter_backing_up(0, use_retrace=True)
+                speed, steering_angle = -self.backup_speed, self._next_retrace_steering(dt)
             else:
                 speed, steering_angle = 0, 0
 
         elif self.avoid_obstacles and self.turn_streak >= self.close_confirm_frames:
             self._start_avoidance_cycle(xy)
             if not any_side_clear:
-                print(self.time, 'all zones blocked, backing up straight to find room', self.last_obstacle)
-                self._enter_backing_up(0)
-                speed, steering_angle = -self.backup_speed, 0
+                print(self.time, 'all zones blocked, backing up straight to find room (retracing path)', self.last_obstacle)
+                self._enter_backing_up(0, use_retrace=True)
+                speed, steering_angle = -self.backup_speed, self._next_retrace_steering(dt)
             else:
                 print(self.time, 'obstacle nearby, start turning', self.last_obstacle)
                 self._enter_turning()
@@ -768,6 +1052,17 @@ class TulakObstacle(Node):
 
         else:
             speed, steering_angle = self.max_speed, self._drive_steering()
+
+        # record forward-driving steering history for a future retrace
+        # backup (see _enter_backing_up/_next_retrace_steering) - only
+        # while actually moving forward, so backing up itself never
+        # pollutes what "the way in" means
+        if speed > 0:
+            self.path_history.append((steering_angle, dt))
+            self.path_history_total += dt
+            while self.path_history_total > self.retrace_buffer_sec and len(self.path_history) > 1:
+                _, old_dt = self.path_history.popleft()
+                self.path_history_total -= old_dt
 
         if self.verbose:
             print(self.time, self.state, speed, steering_angle, self.last_obstacle,
