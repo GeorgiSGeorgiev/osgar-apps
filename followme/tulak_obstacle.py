@@ -367,6 +367,67 @@
       when False, e.g. for terrain where the ground window's calibration
       trap (see obstdet3d_zones.py's docstring) isn't worth fighting yet.
 
+  13. Two field-reported issues, both fixed WITHOUT touching stop_dist/
+      turning_dist or the adaptive-distance formula at all (item 10) -
+      only how the avoidance maneuver behaves once already triggered by
+      those unchanged thresholds:
+
+      (a) "Overcorrects 60-90deg instead of a smaller correction" on a
+      diagonal wall approach. Previously EVERY turn_streak trigger got
+      the identical response: full avoid_steering, full scan_min_sweep -
+      appropriate for a squarely-blocked center, way too much for a
+      shallow graze where only one side zone barely crossed turning_dist
+      while center/the other side are still comfortably clear. Worse,
+      for a genuinely diagonal wall, clearance keeps rising the further
+      you turn away from it, so the old fixed 30deg-minimum sweep would
+      often end up picking a near-the-end-of-the-sweep heading anyway -
+      and if that single pass didn't fully clear it, a SECOND full-lock
+      cycle could stack on top, which is what actually produced the
+      60-90deg the field report described (two ~30-45deg corrections
+      back to back reads as one big one). _enter_turning() now computes
+      a severity 0..1 from how far the closest zone already is past
+      turning_dist toward stop_dist (0 = just barely triggered, 1 =
+      already down near stop_dist) and scales this cycle's turn amplitude
+      and required sweep between new min_avoid_steering_deg/
+      min_scan_sweep_deg floors and the existing avoid_steering_deg/
+      scan_min_sweep_deg ceilings - reached at severity=1, i.e. IDENTICAL
+      to the old always-maximal behaviour for a real, close block.
+      Escape mode (see below) always forces severity=1 too - full
+      commitment there is unchanged from before this item.
+
+      (b) Dead-end oscillation: forward-left, blocked, back, forward-left
+      again, back, forward-left again... Root cause: _best_scan_heading()
+      is a pure greedy optimizer with no memory - every fresh cycle it
+      just picks whatever scored best THIS sweep, with nothing stopping
+      it from re-picking essentially the same heading that already
+      failed one or more cycles ago, if it still happens to score best
+      among the (possibly all mediocre) options actually found. Fixed
+      with failed_headings (a short deque): _start_avoidance_cycle
+      already detects "no real progress since the last cycle" for escape
+      mode (escape_after_cycles/escape_progress_dist_m, unchanged) - now
+      that same no-progress detection also records last_committed_heading
+      (the heading that specific cycle aimed for and that didn't pan
+      out) into failed_headings, cleared the moment real progress IS
+      detected again. _best_scan_heading()'s scoring then penalizes
+      candidates close to anything in failed_headings, tapering to zero
+      at failed_heading_tolerance_deg - so a repeatedly-failing spot
+      progressively pushes the greedy choice toward something ACTUALLY
+      different, including a locally worse-scoring option, rather than
+      reconverging on the same trap - this is what the field report
+      asked for ("sometimes choose the suboptimal route... if it means
+      not getting stuck"), implemented as a bias rather than a random
+      choice so it stays deterministic/debuggable. The penalty is purely
+      subtractive and only ever reorders candidates the sweep already
+      found safe under the UNCHANGED stop_dist/turning_dist/is_emergency
+      checks - it cannot invent a new option or bypass a safety check,
+      so this cannot introduce a crash risk on its own.
+
+      Both fixes are zero-effect in the common case: with an empty
+      failed_headings and severity=1 (a real close block), everything
+      behaves EXACTLY as before this item - they only activate for the
+      specific shallow-encounter / repeated-failure situations they're
+      meant to fix, to minimize risk to already-field-validated behaviour.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
@@ -377,7 +438,9 @@
   reaction_margin_sec, depth_fps, stop_dist_margin_m, turning_lead_sec,
   stop_dist_min, stop_dist_max, turning_dist_min, turning_dist_max,
   adaptive_speed, min_speed, speed_clearance_ceiling, free_space_weight,
-  free_space_lead_margin, max_steering_rate_deg_s, enable_ground_hazard)
+  free_space_lead_margin, max_steering_rate_deg_s, enable_ground_hazard,
+  min_avoid_steering_deg, min_scan_sweep_deg, failed_heading_penalty_weight,
+  failed_heading_tolerance_deg, failed_headings_maxlen)
   have defaults, so existing JSON keeps working unchanged except for
   wiring the new ground_hazard/qr_code/nmea_data/depth_profile inputs
   (see the updated config file). close_confirm_frames behaviour is
@@ -632,6 +695,30 @@ class TulakObstacle(Node):
         self.current_backup_steering = 0
         self.turn_sign = 1  # +1 = left, -1 = right
 
+        # proportional avoidance-turn severity (item 13 at top of file) -
+        # does NOT touch stop_dist/turning_dist (when avoidance triggers
+        # is unchanged) - only how hard it turns once triggered. Full
+        # avoid_steering/scan_min_sweep are still the ceiling, reached at
+        # severity=1 - unchanged from before for a close/severe encounter
+        # and, deliberately, always for escape mode (see _enter_turning).
+        self.min_avoid_steering = math.radians(config.get('min_avoid_steering_deg', 20))
+        self.min_scan_sweep = math.radians(config.get('min_scan_sweep_deg', 10))
+        self.current_avoid_steering = self.avoid_steering  # this cycle's actual turn amplitude, set in _enter_turning
+        # current_scan_min_sweep is initialized further down, right after
+        # scan_min_sweep (its ceiling) is defined - see that section
+
+        # failed-heading memory (item 13) - lets repeated avoidance
+        # cycles at the same stuck spot bias AWAY from a heading that
+        # already turned out not to work, instead of the greedy scan
+        # scorer reconverging on the same locally-best-but-actually-bad
+        # choice every time. Only ever nudges the choice AMONG headings
+        # the sweep already found safe - never bypasses stop_dist/
+        # turning_dist/is_emergency, all unchanged.
+        self.failed_heading_penalty_weight = config.get('failed_heading_penalty_weight', 1.0)
+        self.failed_heading_tolerance = math.radians(config.get('failed_heading_tolerance_deg', 30))
+        self.failed_headings = deque(maxlen=config.get('failed_headings_maxlen', 4))
+        self.last_committed_heading = None  # heading the most recent TURNING committed to - see _start_avoidance_cycle
+
         # retrace-based backing up (see notes at top of file) - replay
         # the recent forward-driving steering history in reverse when
         # backing away from an obstacle, instead of backing up straight/
@@ -647,6 +734,7 @@ class TulakObstacle(Node):
         # minimum angle and pick the best heading seen, instead of
         # grabbing the first momentarily-clear frame
         self.scan_min_sweep = math.radians(config.get('scan_min_sweep_deg', 50))
+        self.current_scan_min_sweep = self.scan_min_sweep  # this cycle's actual required sweep, set in _enter_turning (item 13)
         self.side_zone_weight = config.get('side_zone_weight', 0.5)
         self.bearing_penalty_weight = config.get('bearing_penalty_weight', 0.4)
         # early-exit: don't force the full scan_min_sweep when the very
@@ -920,9 +1008,18 @@ class TulakObstacle(Node):
         closer to bearing_to_target (converted into the same compass
         convention via heading_frame_offset first - see
         _start_avoidance_cycle), only enough to break ties between
-        comparable gaps, not to override a clearer one. Falls back to
-        saved_heading (the pre-avoidance heading) if the sweep produced no
-        samples at all."""
+        comparable gaps, not to override a clearer one. Also penalizes
+        headings close to anything in failed_headings (item 13) - a
+        heading recorded there already led nowhere last time (see
+        _start_avoidance_cycle's no-progress branch), so re-picking it
+        without any push toward something else is exactly what produces
+        a forward/back/forward loop in a genuine dead end. The penalty
+        tapers linearly to 0 at failed_heading_tolerance and never turns
+        positive, so it can only ever make an already-failed direction
+        LESS attractive relative to the others actually found this sweep
+        - it can't invent a new option or override a real safety check.
+        Falls back to saved_heading (the pre-avoidance heading) if the
+        sweep produced no samples at all."""
         if not self.scan_samples:
             return self.saved_heading
 
@@ -938,6 +1035,10 @@ class TulakObstacle(Node):
                 heading_as_bearing = normalize_angle(heading + self.heading_frame_offset)
                 angle_diff = abs(normalize_angle(heading_as_bearing - self.bearing_to_target))
                 s -= self.bearing_penalty_weight * angle_diff
+            for failed in self.failed_headings:
+                diff = abs(normalize_angle(heading - failed))
+                if diff < self.failed_heading_tolerance:
+                    s -= self.failed_heading_penalty_weight * (1 - diff / self.failed_heading_tolerance)
             return s
 
         best_heading, *_ = max(self.scan_samples, key=score)
@@ -1145,6 +1246,27 @@ class TulakObstacle(Node):
         self.scan_start_heading = self.last_heading
         self.scan_confident_streak = 0
 
+        # severity: 0 at the moment turning_dist was just crossed (barely
+        # triggered - a shallow/diagonal graze), 1 once the closest zone
+        # is already down at stop_dist (a real, committed block) - scales
+        # this cycle's turn amplitude and required sweep between the
+        # min_* floor and the full avoid_steering/scan_min_sweep ceiling.
+        # Fixes "turns 60-90deg instead of a smaller correction" on a
+        # diagonal approach: previously EVERY trigger got the full-lock
+        # treatment regardless of how marginal it was. Escape mode always
+        # gets full severity - it was reached specifically because milder
+        # responses already weren't resolving this spot.
+        if self.in_escape_mode:
+            severity = 1.0
+        else:
+            l_dist = self.left_dist if self.left_dist is not None else float('inf')
+            r_dist = self.right_dist if self.right_dist is not None else float('inf')
+            closest = min(self.last_obstacle, l_dist, r_dist)
+            span = max(1e-6, self.turning_dist - self.stop_dist)
+            severity = max(0.0, min(1.0, (self.turning_dist - closest) / span))
+        self.current_avoid_steering = self.min_avoid_steering + severity * (self.avoid_steering - self.min_avoid_steering)
+        self.current_scan_min_sweep = self.min_scan_sweep + severity * (self.scan_min_sweep - self.min_scan_sweep)
+
     def _enter_drive(self):
         self.state = State.DRIVE
         self.saved_heading = None
@@ -1173,7 +1295,16 @@ class TulakObstacle(Node):
         if self.progress_anchor_xy is not None:
             dist = math.hypot(xy[0] - self.progress_anchor_xy[0],
                               xy[1] - self.progress_anchor_xy[1])
-            self.escape_counter = self.escape_counter + 1 if dist < self.escape_progress_dist_m else 0
+            if dist < self.escape_progress_dist_m:
+                self.escape_counter += 1
+                # the heading the LAST cycle committed to didn't lead
+                # anywhere - remember it so _best_scan_heading can bias
+                # away from re-picking the same one this time (item 13)
+                if self.last_committed_heading is not None:
+                    self.failed_headings.append(self.last_committed_heading)
+            else:
+                self.escape_counter = 0
+                self.failed_headings.clear()  # actually moved - old failures no longer relevant
         self.progress_anchor_xy = xy
         was_escaping = self.in_escape_mode
         self.in_escape_mode = self.escape_counter >= self.escape_after_cycles
@@ -1241,7 +1372,12 @@ class TulakObstacle(Node):
                 self._enter_turning()
 
         elif self.avoid_obstacles and self.state == State.TURNING:
-            speed, steering_angle = self.avoid_speed, self.turn_sign * self.avoid_steering
+            # current_avoid_steering/current_scan_min_sweep are severity-
+            # scaled once, at entry (_enter_turning) - see item 13. Full
+            # avoid_steering/scan_min_sweep still apply unchanged for a
+            # close/severe encounter or in escape mode; a shallow/diagonal
+            # graze gets a smaller, quicker correction instead.
+            speed, steering_angle = self.avoid_speed, self.turn_sign * self.current_avoid_steering
             elapsed = self.time - self.state_start_time
             self.scan_samples.append((self.last_heading, self.last_obstacle, self.left_dist, self.right_dist))
             swept = abs(normalize_angle(self.last_heading - self.scan_start_heading))
@@ -1258,7 +1394,7 @@ class TulakObstacle(Node):
                                 and r_dist >= self.scan_confident_dist)
             self.scan_confident_streak = self.scan_confident_streak + 1 if confident_clear else 0
 
-            enough_sweep = swept >= self.scan_min_sweep
+            enough_sweep = swept >= self.current_scan_min_sweep
             confident_enough = self.scan_confident_streak >= self.close_confirm_frames
             if (elapsed > self.min_turn_time and (enough_sweep or confident_enough)) or elapsed > self.max_turn_time:
                 if elapsed > self.max_turn_time and not (enough_sweep or confident_enough):
@@ -1271,6 +1407,9 @@ class TulakObstacle(Node):
                 # notes at top of file for why this also removes the old
                 # escape-mode special case that used to skip realigning
                 self.saved_heading = best_heading
+                # persists past the DRIVE reset of saved_heading, unlike
+                # saved_heading itself - see _start_avoidance_cycle/item 13
+                self.last_committed_heading = best_heading
                 self.state = State.REALIGNING
                 self.state_start_time = self.time
 
@@ -1304,7 +1443,7 @@ class TulakObstacle(Node):
             else:
                 print(self.time, 'obstacle nearby, start turning', self.last_obstacle)
                 self._enter_turning()
-                speed, steering_angle = self.avoid_speed, self.turn_sign * self.avoid_steering
+                speed, steering_angle = self.avoid_speed, self.turn_sign * self.current_avoid_steering
 
         elif self.waypoint_reached:
             speed, steering_angle = 0, 0

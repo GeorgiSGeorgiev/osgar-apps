@@ -51,7 +51,12 @@
             "speed_clearance_ceiling": 3.0,
             "free_space_weight": 0.5,
             "free_space_lead_margin": 1.3,
-            "max_steering_rate_deg_s": 30
+            "max_steering_rate_deg_s": 30,
+            "min_avoid_steering_deg": 20,
+            "min_scan_sweep_deg": 10,
+            "failed_heading_penalty_weight": 1.0,
+            "failed_heading_tolerance_deg": 30,
+            "failed_headings_maxlen": 4
           }
       },
       "platform": {
