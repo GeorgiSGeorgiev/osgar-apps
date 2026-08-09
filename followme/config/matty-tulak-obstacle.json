@@ -56,7 +56,8 @@
             "min_scan_sweep_deg": 10,
             "failed_heading_penalty_weight": 1.0,
             "failed_heading_tolerance_deg": 30,
-            "failed_headings_maxlen": 4
+            "failed_headings_maxlen": 4,
+            "max_bumper_hits": 3
           }
       },
       "platform": {

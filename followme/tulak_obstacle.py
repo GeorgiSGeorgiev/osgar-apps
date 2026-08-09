@@ -428,6 +428,45 @@
       specific shallow-encounter / repeated-failure situations they're
       meant to fix, to minimize risk to already-field-validated behaviour.
 
+  14. Bug fix: on_bumpers_front/on_bumpers_rear only ever zeroed the
+      speed command for a single instant - nothing changed self.state,
+      so on_pose2d's state machine would just recompute from whatever
+      state it was already in on the very next cycle and resume the
+      SAME motion. In the open, this rarely mattered (bumper contact
+      should be rare if the depth-based avoidance is doing its job). In
+      a tightly boxed-in space it's a real gap: the depth camera has no
+      coverage at all behind/beside the robot while BACKING_UP (only the
+      rear bumper does), so a bumper hit there is exactly the situation
+      needing a real reaction, and there wasn't one - field-reported as
+      "sometimes even crashing when reversing" in a very cramped spot.
+      Deliberately NOT fixed by touching stop_dist/turning_dist (not
+      possible anyway - there's no sensor coverage back there to derive
+      a distance from) - fixed by making contact itself trigger a real
+      state change: a rear hit pivots to TURNING using current, live
+      forward sensor data (severity computed fresh, so if backing up
+      already gained a bit of room, the response reflects that); a front
+      hit backs off straight, same fixed/non-clever reaction as the
+      existing is_emergency abort. Past max_bumper_hits repeated hits
+      with no real progress since (bumper_hit_streak, reset at the same
+      point as escape_counter/failed_headings), gives up and raises
+      EmergencyStopException rather than continuing to retry - a spot
+      that keeps producing contact regardless of what's tried needs a
+      human, not another automatic attempt. Unlike ground_hazard, this
+      has no non-terminating mode: recovery there is a sensor reading
+      becoming valid again on its own; a bumper is a one-shot contact
+      event with no equivalent "it got better" signal to wait for while
+      sitting still, so there's nothing sensible for a non-terminating
+      mode to do besides freeze forever.
+
+      Also removed dead/duplicate code in on_nmea_data: two copies of
+      the same throttled status-log block ran back to back. The second
+      was unreachable in practice (the first always just reset
+      last_gps_log_time to now, so the second's own time-since-last-log
+      check could never pass) - but had it ever run with no GPS fix
+      (lat/lon None), it would have crashed formatting None into
+      _gps_status_line's '%.6f'. Removed, no behaviour change (it never
+      executed).
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
@@ -440,7 +479,7 @@
   adaptive_speed, min_speed, speed_clearance_ceiling, free_space_weight,
   free_space_lead_margin, max_steering_rate_deg_s, enable_ground_hazard,
   min_avoid_steering_deg, min_scan_sweep_deg, failed_heading_penalty_weight,
-  failed_heading_tolerance_deg, failed_headings_maxlen)
+  failed_heading_tolerance_deg, failed_headings_maxlen, max_bumper_hits)
   have defaults, so existing JSON keeps working unchanged except for
   wiring the new ground_hazard/qr_code/nmea_data/depth_profile inputs
   (see the updated config file). close_confirm_frames behaviour is
@@ -756,6 +795,19 @@ class TulakObstacle(Node):
         self.in_escape_mode = False
         self.progress_anchor_xy = None
 
+        # bumper contact (item 14 at top of file) - last-resort backstop
+        # for the depth camera's blind spots, the big one being straight
+        # behind while BACKING_UP. A hit now aborts the current maneuver
+        # for real, instead of just zeroing the command for one instant
+        # and letting the state machine resume the very same motion next
+        # cycle. Past max_bumper_hits with no real progress since, gives
+        # up and stops for good - same "don't keep trying forever"
+        # pattern as ground_hazard/max_backup_time/max_turn_time.
+        self.max_bumper_hits = config.get('max_bumper_hits', 3)
+        self.bumper_hit_streak = 0
+        self.bumper_stop_active = False
+        self._last_xy = (0.0, 0.0)  # updated every on_pose2d cycle - see _on_bumper_hit
+
     def send_speed_cmd(self, speed, steering_angle):
         return self.bus.publish(
             'desired_steering',
@@ -770,11 +822,54 @@ class TulakObstacle(Node):
 
     def on_bumpers_front(self, data):
         if data:
-            self.send_speed_cmd(0, 0)
+            self._on_bumper_hit(rear=False)
 
     def on_bumpers_rear(self, data):
         if data:
-            self.send_speed_cmd(0, 0)
+            self._on_bumper_hit(rear=True)
+
+    def _on_bumper_hit(self, rear):
+        """Physical contact - the last-resort backstop for exactly the
+        blind spot the depth camera can't cover (nothing looks behind or
+        to the sides while BACKING_UP; a front hit means the forward
+        camera missed something too - low object, invalid-data gap,
+        etc). Previously on_bumpers_front/rear only zeroed the command
+        for a single instant - nothing here changed self.state, so
+        on_pose2d's state machine would just recompute and resume the
+        SAME motion on the very next cycle. That gap is very likely why
+        reversing could still end in contact in a tightly boxed-in space:
+        the bumper fired, but nothing stopped the robot from immediately
+        trying the same direction again.
+
+        Now a hit persistently aborts whatever was happening: a rear hit
+        means backing up further this way isn't actually safe, so pivot
+        to trying a turn (using current, live forward sensor data -
+        _enter_turning computes severity fresh, so if the front has
+        opened up a bit from backing up already, it responds
+        accordingly); a front hit backs off straight, same fixed/non-
+        clever reaction as the existing is_emergency abort (not the
+        moment to trust retrace). _start_avoidance_cycle is called first
+        (a no-op if already mid-cycle, e.g. a rear hit during an already-
+        active BACKING_UP) so saved_heading/progress-tracking stay
+        consistent either way. bumper_hit_streak (reset on real progress,
+        same place as escape_counter/failed_headings - see
+        _start_avoidance_cycle) escalates to a persistent full stop past
+        max_bumper_hits with no progress - a spot that keeps producing
+        contact no matter what's tried needs a human, not another retry."""
+        self.send_speed_cmd(0, 0)
+        self.bumper_hit_streak += 1
+        side = 'rear' if rear else 'front'
+        print(self.time, 'bumper contact (%s) - aborting current maneuver (streak %d/%d)' %
+              (side, self.bumper_hit_streak, self.max_bumper_hits))
+        if self.bumper_hit_streak >= self.max_bumper_hits:
+            print(self.time, 'repeated bumper contact with no progress since - giving up, stopping')
+            self.bumper_stop_active = True
+            raise EmergencyStopException()
+        self._start_avoidance_cycle(self._last_xy)
+        if rear:
+            self._enter_turning()
+        else:
+            self._enter_backing_up(0, use_retrace=False)
 
     def on_rotation(self, data):
         yaw_cdeg = data[0]
@@ -888,10 +983,6 @@ class TulakObstacle(Node):
                       (self.target_lat, self.target_lon))
             else:
                 print(self.time, 'GPS: no fix yet, no target set')
-
-        if self.last_gps_log_time is None or (self.time - self.last_gps_log_time) >= self.gps_log_interval:
-            self.last_gps_log_time = self.time
-            print(self.time, 'GPS', self._gps_status_line(lat, lon))
 
     def on_obstacle_zones(self, data):
         if not self.have_obstacle_data:
@@ -1305,6 +1396,7 @@ class TulakObstacle(Node):
             else:
                 self.escape_counter = 0
                 self.failed_headings.clear()  # actually moved - old failures no longer relevant
+                self.bumper_hit_streak = 0  # actually moved - past bumper contacts no longer relevant
         self.progress_anchor_xy = xy
         was_escaping = self.in_escape_mode
         self.in_escape_mode = self.escape_counter >= self.escape_after_cycles
@@ -1315,6 +1407,7 @@ class TulakObstacle(Node):
     def on_pose2d(self, data):
         x_mm, y_mm, heading_cdeg = data
         xy = (x_mm / 1000.0, y_mm / 1000.0)
+        self._last_xy = xy  # for _on_bumper_hit, which fires from its own callback with no pose2d of its own
         if not self.have_imu_heading:
             self.last_heading = math.radians(heading_cdeg / 100.0)
 
@@ -1340,6 +1433,15 @@ class TulakObstacle(Node):
         if self.ground_hazard_active:
             # confirmed drop-off/staircase - stay stopped every cycle,
             # don't let the normal state machine drive through it
+            self.send_speed_cmd(0, 0)
+            return
+
+        if self.bumper_stop_active:
+            # repeated bumper contact with no progress - see _on_bumper_hit.
+            # terminate_on_stop's EmergencyStopException should already
+            # have ended the run by the time this could ever be reached -
+            # this is the same belt-and-suspenders pattern as
+            # ground_hazard_active above, not a normally-reachable path
             self.send_speed_cmd(0, 0)
             return
 
