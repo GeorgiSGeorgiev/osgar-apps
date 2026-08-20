@@ -222,6 +222,65 @@ def draw_shift_gauge(img, zones, orig_height, scale):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 215, 255), 1, cv2.LINE_AA)
 
 
+def draw_free_space_bins(depth_panel, app, zones, scale):
+    """Visualizes the same depth_profile bins _free_space_steering() reads
+    for its continuous "lean toward whichever side is more open" nudge -
+    the guiding signal behind ordinary cruising's minor corrections,
+    separate from (and acting well before) the discrete L/C/R avoidance
+    zones. Drawn at the bins' ACTUAL sampled region (free_space_cols x
+    zones.free_space_rows - its own pitch-compensated row window, see
+    obstdet3d_zones.py, normally taller than but NOT the same box as the
+    narrow C zone, and deliberately nowhere near the full frame height)
+    instead of an arbitrary fixed screen position, so what you see here
+    is honestly where the bins are looking, not just their column split.
+    Gray outline = the sampled free_space_cols x free_space_rows region;
+    colored strip along its bottom edge = the bins themselves. Green =
+    counts toward the pull (brighter = more clearance past the
+    threshold), dark red = present but not clear enough to count, gray
+    fill = no valid data in that bin - same fail_value=None convention as
+    the L/R zones. Yellow marker = the resulting weighted aim point;
+    absent whenever nothing currently counts (matches
+    _free_space_steering() returning 0.0)."""
+    c0, c1 = zones.free_space_cols
+    r0, r1 = zones.free_space_rows
+    n = len(app.depth_profile) if app.depth_profile else zones.free_space_bins
+    edges = np.linspace(c0, c1, n + 1)
+    free_space_min_dist = app.turning_dist * app.free_space_lead_margin
+
+    x0_all, x1_all = int(c0 * scale), int(c1 * scale)
+    y0_all, y1_all = int(r0 * scale), int(r1 * scale)
+    cv2.rectangle(depth_panel, (x0_all, y0_all), (x1_all, y1_all), (120, 120, 120), 1)
+    cv2.putText(depth_panel, "FS BINS", (x0_all, y0_all - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                0.4, (200, 200, 200), 1, cv2.LINE_AA)
+
+    bar_top, bar_bottom = y1_all + 4, y1_all + 18
+    total_weight, weighted_x = 0.0, 0.0
+    for i in range(n):
+        x0, x1 = int(edges[i] * scale), int(edges[i + 1] * scale)
+        d = app.depth_profile[i] if app.depth_profile else None
+        if d is None:
+            color = (80, 80, 80)
+        elif d <= free_space_min_dist:
+            color = (0, 0, 140)
+        else:
+            # capped the same way _free_space_steering() caps it - see
+            # that method's docstring - so this marker/coloring matches
+            # what actually steers the robot, not an uncapped stand-in
+            weight = min(d - free_space_min_dist, free_space_min_dist)
+            frac = min(1.0, weight / free_space_min_dist) if free_space_min_dist > 0 else 1.0
+            color = (0, int(90 + 130 * frac), 0)
+            total_weight += weight
+            weighted_x += weight * (edges[i] + edges[i + 1]) / 2
+        cv2.rectangle(depth_panel, (x0, bar_top), (x1, bar_bottom), color, -1)
+        cv2.rectangle(depth_panel, (x0, bar_top), (x1, bar_bottom), (200, 200, 200), 1)
+
+    if total_weight > 0:
+        aim_x = int((weighted_x / total_weight) * scale)
+        pts = np.array([[aim_x - 6, bar_bottom + 10], [aim_x + 6, bar_bottom + 10], [aim_x, bar_bottom + 2]],
+                        dtype=np.int32)
+        cv2.fillPoly(depth_panel, [pts], (0, 215, 255))
+
+
 def fmt_dist(x):
     return f"{x:4.2f}m" if x is not None else " None"
 
@@ -244,16 +303,25 @@ def build_hud_lines(dt, app, zones, reason_log):
 
     lines.append(
         f"zones: L={fmt_dist(app.left_dist)}  C={app.last_obstacle:4.2f}m  R={fmt_dist(app.right_dist)}"
+        f"   (stop_dist={app.stop_dist:.2f}m turning_dist={app.turning_dist:.2f}m)"
         f"   stop_streak={app.stop_streak} turn_streak={app.turn_streak}"
         + ("   ESCAPE MODE" if app.in_escape_mode else "")
     )
+
+    free_space_min_dist = app.turning_dist * app.free_space_lead_margin
+    n_open = sum(1 for d in app.depth_profile if d is not None and d > free_space_min_dist)
+    lines.append(
+        f"free-space bins: {n_open}/{len(app.depth_profile)} open (>{free_space_min_dist:.2f}m)"
+        f"   aim={math.degrees(app._free_space_steering()):+.1f}deg"
+    )
+
     lines.append(f"ground_hazard: active={app.ground_hazard_active}  streak={app.ground_hazard_streak}")
 
     pitch_deg = math.degrees(zones.smoothed_pitch)
     lines.append(
         f"depth window shift: {zones.applied_shift_px:+.0f}px "
         f"(pitch {pitch_deg:+.1f}deg + mount tilt {zones.camera_tilt_deg:+.1f}deg)"
-        f"   rows={zones.rows}  ground_rows={zones.ground_rows}"
+        f"   rows={zones.rows}  ground_rows={zones.ground_rows}  free_space_rows={zones.free_space_rows}"
     )
 
     # raw (unsmoothed, UN-offset-corrected) IMU readout, all three axes
@@ -303,6 +371,7 @@ def render_frame(dt, depth_mm, color_img, mask, app, zones, reason_log, max_dept
     draw_zone(depth_panel, zones.rows, zones.right_cols, (0, 0, 255), 'R', depth_scale)
     draw_zone(depth_panel, zones.ground_rows, zones.ground_cols, (0, 255, 255), 'GROUND', depth_scale)
     draw_shift_gauge(depth_panel, zones, h, depth_scale)
+    draw_free_space_bins(depth_panel, app, zones, depth_scale)
 
     if color_size is not None:
         cw, ch = color_size
