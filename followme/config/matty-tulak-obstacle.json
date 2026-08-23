@@ -87,7 +87,11 @@
             "polar_memory_max_travel_m": 1.5,
             "polar_profile_hfov_deg": 66,
             "polar_memory_log_interval_sec": 5.0,
-            "polar_memory_far_fill_m": 13.5
+            "polar_memory_far_fill_m": 13.5,
+            "blind_hold_enabled": true,
+            "blind_profile_valid_frac": 0.25,
+            "blind_confirm_frames": 3,
+            "blind_clear_frames": 3
           }
       },
       "platform": {

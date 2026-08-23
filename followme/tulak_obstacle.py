@@ -805,6 +805,39 @@
       most likely to make things worse. Accumulating the turning the robot
       already does costs nothing and needs no room.
 
+  22. Blind-sensor hold. Outdoor runs (2026-08-23, bright sun) showed the
+      depth camera returning almost nothing: whole frames 99.6-100%
+      invalid INCLUDING the ground rows - not a horizon/sky problem, a
+      total stereo blackout - with the centre zone pinned at its 0.0
+      fail-safe for 100% of several runs. Because 0.0 means "assume the
+      worst", the state machine read it as an obstacle at zero distance
+      and answered with backup-and-turn, so a blind camera produced
+      continuous REVERSING: the one maneuver with no forward sensor
+      coverage, guided only by a rear bumper. Nothing in the file
+      distinguished "something is close" from "I cannot see" - both
+      arrive as center == 0.0.
+
+      Now they are distinct. _update_blind_state confirms blindness from
+      the centre fail-safe AND most of depth_profile being unknown (both
+      required - a blank centre alone is still ordinary close-obstacle
+      business), debounced in both directions, and on_pose2d holds the
+      robot stationary ahead of every other check. It releases by itself
+      once real depth returns.
+
+      This also closes a camera-boot gap: have_obstacle_data only waits
+      for the FIRST obstacle_zones message, so as soon as the pipeline
+      began publishing - even while still settling and emitting blank
+      frames - the robot was free to drive on empty data. It now stays
+      put until frames actually carry depth, and re-arms if they stop.
+
+      Known tradeoff: a surface pressed hard against the lens blanks the
+      frame the same way a blackout does, and this cannot tell them apart
+      (obstdet3d_zones documents the same ambiguity for ground_hazard).
+      In that case Matty will now sit still where it previously backed
+      off. That is the deliberate choice - reversing blind is exactly the
+      risk this exists to remove - but it means a nose-in-a-bush stall
+      needs a human or a manual nudge rather than recovering itself.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
@@ -825,7 +858,9 @@
   edge_correction_center_in_gap, stop_confirm_frames,
   speed_side_clearance_factor, polar_memory_bins, polar_memory_max_age_sec,
   polar_memory_max_travel_m, polar_profile_hfov_deg,
-  polar_memory_log_interval_sec)
+  polar_memory_log_interval_sec, polar_memory_far_fill_m,
+  blind_hold_enabled, blind_profile_valid_frac, blind_confirm_frames,
+  blind_clear_frames)
   have defaults, so existing JSON keeps working unchanged except for
   wiring the new ground_hazard/qr_code/nmea_data/depth_profile inputs
   (see the updated config file). close_confirm_frames behaviour is
@@ -1192,6 +1227,42 @@ class TulakObstacle(Node):
         # beside me, as there have been all along".
         self.center_blocked_streak = 0
         self.depth_profile = []  # free_space_bins distances - see on_depth_profile/_free_space_steering
+
+        # --- blind-sensor hold (item 22) ---
+        # When the depth camera returns essentially nothing, the robot
+        # holds still instead of maneuvering. Distinct from every other
+        # stop in this file: those all mean "something is there", this one
+        # means "I cannot see, full stop".
+        #
+        # Why it needs to be its own state rather than falling out of the
+        # existing logic: an all-invalid centre window makes _dist return
+        # its fail_value of 0.0 ("assume worst"), which the state machine
+        # reads as an obstacle at zero distance and answers with the
+        # standard backup-and-turn. So a blind camera produced continuous
+        # REVERSING - the single maneuver with no forward sensor coverage
+        # at all, steered only by a rear bumper. Field data (2026-08-23
+        # outdoors, bright sun): whole frames 99.6-100% invalid INCLUDING
+        # the ground rows, centre pinned at the 0.0 fail-safe for 100% of
+        # several runs, robot reversing the entire time.
+        #
+        # Also covers camera boot. have_obstacle_data only waits for the
+        # FIRST obstacle_zones message, so once the pipeline starts
+        # publishing - even if those first frames are blank while it is
+        # still settling - that gate opens and the robot drives on empty
+        # data. This hold keeps it stationary until frames actually carry
+        # depth, and re-arms automatically if they stop.
+        #
+        # Deliberately requires BOTH conditions: the centre blank AND most
+        # of the wider profile blank. The centre alone going invalid is
+        # something the ordinary obstacle logic should keep handling as a
+        # possible close object.
+        self.blind_hold_enabled = config.get('blind_hold_enabled', True)
+        self.blind_profile_valid_frac = config.get('blind_profile_valid_frac', 0.25)
+        self.blind_confirm_frames = config.get('blind_confirm_frames', 3)
+        self.blind_clear_frames = config.get('blind_clear_frames', 3)
+        self.depth_blind_active = False
+        self.blind_streak = 0
+        self.blind_clear_streak = 0
         # the OAK pipeline takes several seconds to boot, during which
         # last_obstacle/left_dist/right_dist above still hold their
         # "assume clear" init values - stay stopped in on_pose2d until the
@@ -1737,6 +1808,52 @@ class TulakObstacle(Node):
 
     def on_depth_profile(self, data):
         self.depth_profile = data
+        # evaluated here rather than in on_obstacle_zones because
+        # ObstacleDetector3DZones publishes obstacle_zones first and
+        # depth_profile second for the same frame - by this point both
+        # halves of the test below are from the same depth image
+        self._update_blind_state()
+
+    def _update_blind_state(self):
+        """Is the depth camera returning anything usable at all? See the
+        blind-sensor hold notes in __init__.
+
+        Two independent signals, both required:
+          - the centre zone reporting exactly its fail_value (0.0). That
+            is the sentinel _dist() returns when a window has less than
+            min_valid_frac usable pixels; a real measurement can never be
+            0.0, since any nonzero depth in mm is a positive number of
+            metres once divided.
+          - most of depth_profile unknown, i.e. the blankness is across
+            the view rather than confined to the centre window.
+
+        Debounced both ways (blind_confirm_frames / blind_clear_frames) so
+        neither a single dropped frame freezes the robot nor a single
+        lucky frame releases it."""
+        if not self.blind_hold_enabled:
+            return
+        center_blank = self.last_obstacle <= 0.0
+        if self.depth_profile:
+            valid_frac = sum(1 for d in self.depth_profile if d is not None) / len(self.depth_profile)
+        else:
+            valid_frac = 0.0
+        blind_now = center_blank and valid_frac < self.blind_profile_valid_frac
+
+        if blind_now:
+            self.blind_streak += 1
+            self.blind_clear_streak = 0
+        else:
+            self.blind_clear_streak += 1
+            self.blind_streak = 0
+
+        if not self.depth_blind_active and self.blind_streak >= self.blind_confirm_frames:
+            self.depth_blind_active = True
+            print(self.time, 'depth camera is blind (centre invalid, %.0f%% of the profile unknown) - '
+                              'holding still until it recovers' % (100 * (1 - valid_frac)))
+        elif self.depth_blind_active and self.blind_clear_streak >= self.blind_clear_frames:
+            self.depth_blind_active = False
+            print(self.time, 'depth data recovered (%.0f%% of the profile valid) - resuming'
+                   % (100 * valid_frac))
 
     def on_ground_hazard(self, data):
         """data is [hazard_bool, ground_valid_frac, ground_dist] for this
@@ -2872,6 +2989,19 @@ class TulakObstacle(Node):
             # this point, but last_obstacle/left_dist/right_dist are still
             # unset "assume clear" defaults, not a confirmed clear path.
             # Stay stopped rather than drive blind.
+            self.send_speed_cmd(0, 0)
+            return
+
+        if self.depth_blind_active:
+            # the camera is returning essentially nothing - see
+            # _update_blind_state. Hold still: do NOT hand this to the
+            # avoidance state machine, which would read the centre's 0.0
+            # fail-safe as an obstacle and answer by reversing, i.e. by
+            # moving in the one direction nothing watches at all. Placed
+            # ahead of every other hold because it is the most fundamental
+            # of them: the others act on what was sensed, this one applies
+            # when nothing was.
+            self._last_commanded_speed = 0.0
             self.send_speed_cmd(0, 0)
             return
 
