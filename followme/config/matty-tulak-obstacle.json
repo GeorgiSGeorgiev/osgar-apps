@@ -37,6 +37,9 @@
             "compass_offset_smoothing_alpha": 0.1,
             "compass_calibration_min_quality": 1,
             "compass_calibration_max_hdop": 3.0,
+            "compass_calibration_max_heading_spread_deg": 12.0,
+            "compass_learn_offset": false,
+            "compass_offset_deg": 6.1,
             "waypoint_arrival_dist_m": 3.0,
             "bearing_blend_road_frac": 0.3,
             "bearing_near_target_dist_m": 15.0,
@@ -91,7 +94,9 @@
             "blind_hold_enabled": true,
             "blind_profile_valid_frac": 0.25,
             "blind_confirm_frames": 3,
-            "blind_clear_frames": 3
+            "blind_clear_frames": 3,
+            "blind_creep_speed": 0.15,
+            "blind_creep_max_dist_m": 0.0
           }
       },
       "platform": {
@@ -152,7 +157,7 @@
           "stereo_spatial_filter_num_iterations": 1,
           "stereo_brightness_filter": true,
           "stereo_brightness_filter_min": 0,
-          "stereo_brightness_filter_max": 235,
+          "stereo_brightness_filter_max": 250,
           "stereo_threshold_filter_min_mm": 200,
           "stereo_threshold_filter_max_mm": 15000,
           "stereo_extended_disparity": false,

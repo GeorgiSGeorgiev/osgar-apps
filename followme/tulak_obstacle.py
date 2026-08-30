@@ -838,6 +838,99 @@
       risk this exists to remove - but it means a nose-in-a-bush stall
       needs a human or a manual nudge rather than recovering itself.
 
+  25. Compass can now run without GPS correction at all
+      (compass_offset_deg / compass_learn_offset - see __init__).
+      compass_offset corrects declination plus a fixed mount rotation;
+      both are constants, so learning them at runtime was only ever a way
+      to avoid having to know them. Setting compass_offset_deg seeds the
+      value at boot - the compass is then usable from the first cycle
+      instead of after the ~36-58s needed to accumulate a straight,
+      forward, quality-passing 5m GPS leg - and compass_learn_offset=False
+      stops GPS refining it thereafter. GPS still supplies the target and
+      the distance to it; it just stops being in the heading loop.
+
+      +6.1deg is the measured starting point (constant term of the fit
+      over 48 straight forward legs from the 2026-08-07/08-23 logs).
+      Note the same fit found 5.6deg of error varying WITH heading, which
+      is hard-iron distortion and cannot be removed by any single number
+      here - that needs a magnetometer ellipsoid calibration on the ESP32.
+
+  24. Blind behaviour is now a dial, not a switch (blind_creep_speed /
+      blind_creep_max_dist_m - see __init__). Item 22 always stopped, and
+      standing still is not automatically the safest option in context: a
+      competition run that has to reach a waypoint cannot spend 3-18% of
+      itself parked, which is what the 2026-08-23 runs measured. Setting
+      blind_creep_speed > 0 keeps Matty moving forward at that speed
+      instead, steered by whatever still works - _drive_steering degrades
+      to the RGB road mask plus GPS bearing on its own, since
+      _depth_confidence() reads 0 with an all-unknown profile and drops
+      the depth term out of the blend. The road mask really does keep
+      working through a stereo blackout: 0.20-0.22 drivable fraction
+      during blackouts against 0.23-0.31 with healthy depth, on the same
+      logs.
+
+      What makes a blind crawl defensible is speed and nothing else. The
+      2026-08-23 leg impact happened at 0.50m/s; the same contact at
+      0.15m/s is a bumper tap. Keep blind_creep_speed at or below
+      min_speed - above that it stops being a mitigation.
+
+      Two bounds come with it. Creeping only happens from DRIVE, because
+      going blind partway through an avoidance maneuver means something
+      was already known to be there. And blind_creep_max_dist_m caps how
+      far one blind stretch may travel; 0 means unlimited, which is both
+      what "just keep going" asks for and what will eventually drive into
+      water given a long enough blackout, so set a real budget on any
+      route near a drop.
+
+  23. Compass calibration was learning from curved legs. compass_offset is
+      physically a near-constant (magnetic declination + fixed mount
+      error), but the 2026-08-23 outdoor runs had it swinging +13.6..+67.8
+      deg inside one run and -1.0..+21.0 deg in another - and NOT because
+      of poor GPS: those runs were DGPS quality 2, 12 satellites, hdop
+      0.55-1.08, 100% fix rate.
+
+      The offset is learned from travel_heading, the bearing between two
+      fixes gps_heading_min_baseline_m apart. That equals the robot's
+      heading only if it drove roughly straight between them - and under
+      continuous obstacle avoidance it does not, it curves, so the chord
+      bearing differs from anywhere the robot was ever pointing. The
+      existing quality/hdop gates are blind to this: the fix can be
+      flawless while the path is an arc.
+
+      _baseline_was_straight now requires the heading to have stayed within
+      compass_calibration_max_heading_spread_deg across the whole baseline
+      before that leg may teach anything, with the wander tracked
+      incrementally per leg (_track_baseline_heading). Re-analysing the
+      same logs offline with exactly this filter turns the same hardware
+      and the same fixes into a stable median offset of +5.4deg / -2.3deg
+      holding to about +-1deg over six minutes - the sensor was never the
+      problem, the training data was.
+
+      Rejected legs are counted and surfaced as cal_skipped in the GPS
+      status line: if that climbs while compass_offset never settles, the
+      robot simply is not driving straight long enough to calibrate, which
+      is a different problem from a bad compass and should not be mistaken
+      for one. Set the spread to 0 to disable the gate.
+
+      A second, larger source of the same corruption, found while checking
+      the above against 57 straight legs from the 2026-08-07/08-23 outdoor
+      logs: REVERSE legs. Backing up in a straight line passes the spread
+      test perfectly, but the GPS chord then points ~180deg away from where
+      the robot was facing, so the leg teaches an offset that is half a
+      turn wrong. Matty reverses for 30-40% of some runs. Measured over
+      those legs: including reversals the offset averaged +12.9deg with
+      outliers to +134.5deg; excluding them, +3.9deg with a maximum of
+      +24.0deg. _baseline_was_straight now also rejects any leg containing
+      reverse motion, and does so even when the spread gate is disabled -
+      a backwards chord is wrong regardless of how straight it was.
+
+      For reference, with reverse and curved legs both excluded, that same
+      data fits offset = +6.1deg + 5.6deg*cos(heading - 19deg). The
+      constant is a good match for Prague's magnetic declination; the
+      heading-DEPENDENT term is residual hard-iron distortion, which no
+      single scalar offset can correct - see the compass notes for what
+      that would take.
+
   All new config keys (escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
@@ -860,7 +953,8 @@
   polar_memory_max_travel_m, polar_profile_hfov_deg,
   polar_memory_log_interval_sec, polar_memory_far_fill_m,
   blind_hold_enabled, blind_profile_valid_frac, blind_confirm_frames,
-  blind_clear_frames)
+  blind_clear_frames, blind_creep_speed, blind_creep_max_dist_m,
+  compass_calibration_max_heading_spread_deg)
   have defaults, so existing JSON keeps working unchanged except for
   wiring the new ground_hazard/qr_code/nmea_data/depth_profile inputs
   (see the updated config file). close_confirm_frames behaviour is
@@ -1199,7 +1293,94 @@ class TulakObstacle(Node):
         # treated as passable rather than failing closed in that case.
         self.compass_calibration_min_quality = config.get('compass_calibration_min_quality', 1)
         self.compass_calibration_max_hdop = config.get('compass_calibration_max_hdop', 3.0)
-        self.compass_offset = None  # radians, learned - see _update_compass_calibration
+        # Straightness gate on LEARNING a calibration point (item 23).
+        # travel_heading is the bearing between two GPS fixes
+        # gps_heading_min_baseline_m apart - which equals the robot's actual
+        # heading ONLY if it drove roughly straight between them. Under
+        # continuous obstacle avoidance it does not: it curves, and then the
+        # chord bearing differs from where the robot was ever pointing, so
+        # every such sample injects an error into compass_offset. The
+        # existing quality/hdop gates cannot see this at all - the fix can
+        # be perfect while the path is a arc.
+        #
+        # Field evidence (2026-08-23, DGPS quality 2, 12 sats, hdop
+        # 0.55-1.08 - i.e. GPS as good as it gets): compass_offset still
+        # swung +13.6..+67.8deg inside a single run, and -1.0..+21.0deg in
+        # another, for a quantity that is physically a near-constant
+        # (magnetic declination plus a fixed mount error). Re-analysing the
+        # same logs offline while accepting ONLY legs where yaw stayed
+        # within 8deg gave a stable median of +5.4deg / -2.3deg holding to
+        # about +-1deg over six minutes. Same hardware, same fixes - the
+        # sensor was never the problem, the training data was.
+        #
+        # So: require the heading to have stayed within this spread across
+        # the whole baseline before the leg is allowed to teach anything.
+        # 0 disables the gate (old behaviour - learn from every
+        # quality-passing leg).
+        #
+        # 12deg is swept, not guessed - offset swing across the four
+        # 2026-08-23 runs, replaying each at several thresholds:
+        #     gate:      off     8deg    12deg   15deg   20deg
+        #     130201:   22.1    NEVER     0.0     0.7     0.7
+        #     130549:   54.1      9.3    14.1    20.5    41.8
+        #     130944:    4.8      0.0     0.2     1.1     1.1
+        #     125614:   12.9      0.0     2.6     4.6     7.0
+        # 8deg is tighter where it works, but 130201 never drove straight
+        # for a full baseline and so never calibrated AT ALL - which is
+        # worse than a noisy offset, since the robot then falls back to
+        # GPS fix-differencing for heading (exactly what item 15 replaced).
+        # 12deg is the loosest setting at which every run still calibrates
+        # while the swings stay collapsed. Cost: first calibration lands
+        # around t=36-58s instead of 21-28s, so allow roughly a minute of
+        # driving before compass heading is fully trustworthy.
+        self.compass_calibration_max_spread = math.radians(
+            config.get('compass_calibration_max_heading_spread_deg', 8.0))
+        # circular min/max of last_heading since the current baseline anchor,
+        # tracked incrementally relative to the first sample - see
+        # _track_baseline_heading/_baseline_heading_spread
+        self._baseline_ref_heading = None
+        self._baseline_dmin = 0.0
+        self._baseline_dmax = 0.0
+        # Did the robot reverse anywhere in this baseline? A leg driven
+        # BACKWARDS is perfectly straight by the spread test above, but its
+        # GPS chord bearing points 180deg away from where the robot was
+        # facing - so it teaches the compass an offset that is a half turn
+        # wrong. Matty reverses for 30-40% of some runs, so this is not a
+        # corner case. Measured over 57 straight legs from the 2026-08-07
+        # and 2026-08-23 outdoor logs: including reverse legs the offset
+        # averaged +12.9deg with outliers to +134.5deg; excluding them,
+        # +3.9deg with a maximum of +24.0deg.
+        self._baseline_had_reverse = False
+        self.compass_cal_skipped = 0   # legs rejected as curved or reversed - diagnostics
+        # --- fixed vs learned compass offset (item 25) ---
+        # compass_offset corrects magnetic declination plus the fixed mount
+        # rotation. Both are constants, so it does not HAVE to be learned at
+        # runtime - learning it from GPS was only ever a way to avoid having
+        # to know them. Two knobs to skip that entirely:
+        #
+        #   compass_offset_deg   seeds the offset at startup, so the compass
+        #                        is usable from the first cycle instead of
+        #                        after the ~36-58s it takes to accumulate a
+        #                        straight, forward, quality-passing GPS leg.
+        #   compass_learn_offset set False to stop GPS refining it at all,
+        #                        leaving the compass to run open-loop.
+        #
+        # Together they answer "how does Matty steer on compass alone" -
+        # no 5m baselines, no travel_heading, GPS reduced to supplying the
+        # target and the distance to it.
+        #
+        # Fitted from 48 straight forward legs across the 2026-08-07 and
+        # 08-23 outdoor logs, the constant part of the offset was +6.1deg,
+        # which is a sensible starting value for compass_offset_deg here
+        # (Prague declination is about +5.2degE, the rest being mount
+        # rotation). The same fit found a further 5.6deg varying WITH
+        # heading - hard-iron distortion, which no single number can
+        # correct; removing that needs a magnetometer ellipsoid calibration
+        # on the ESP32 side, not anything in this file.
+        self.compass_learn_offset = config.get('compass_learn_offset', True)
+        fixed_offset_deg = config.get('compass_offset_deg')
+        self.compass_offset = (math.radians(fixed_offset_deg)
+                                if fixed_offset_deg is not None else None)
         self.compass_last_calibrated = None  # self.time of the last calibration update, diagnostics only
 
         self.target_lat = None
@@ -1263,6 +1444,51 @@ class TulakObstacle(Node):
         self.depth_blind_active = False
         self.blind_streak = 0
         self.blind_clear_streak = 0
+
+        # --- what to DO while blind (item 24) - three settings, from most
+        # to least conservative:
+        #
+        #   blind_hold_enabled=False
+        #       No blind handling at all. The centre's 0.0 fail-safe goes
+        #       to the state machine as before, which reads it as an
+        #       obstacle and reverses. Restores pre-item-22 behaviour.
+        #   blind_hold_enabled=True, blind_creep_speed=0
+        #       Stand still until depth returns (item 22's behaviour).
+        #   blind_hold_enabled=True, blind_creep_speed>0
+        #       Keep going forward at that speed instead of stopping.
+        #
+        # The creep exists because standing still is not always the safest
+        # option in context: a run that must reach a waypoint cannot spend
+        # 3-18% of itself parked (measured over the 2026-08-23 runs), and
+        # a robot stopped in the open is not obviously better off than one
+        # moving at a crawl. What makes the crawl defensible is speed
+        # alone - the 2026-08-23 leg impact happened at 0.50m/s, where the
+        # same contact at 0.15m/s is a bumper tap. Anything above
+        # min_speed defeats the point, so keep it at or below that.
+        #
+        # Steering while creeping comes from _drive_steering(), which
+        # degrades correctly on its own: with depth_profile all-unknown
+        # _depth_confidence() returns 0, so the depth term drops out of
+        # the blend and what remains is the RGB road mask plus the GPS
+        # bearing. Both keep working while stereo does not - measured on
+        # the 2026-08-23 logs, the road mask stayed at a 0.20-0.22
+        # drivable fraction during blackouts against 0.23-0.31 when depth
+        # was healthy.
+        #
+        # Two safety bounds, both deliberate:
+        #  - creeping only happens from DRIVE. Going blind midway through
+        #    an avoidance maneuver means something was already known to be
+        #    there, and blind-driving forward into it is exactly wrong; in
+        #    any other state the robot holds regardless of this setting.
+        #  - blind_creep_max_dist_m caps how far one blind stretch may
+        #    travel before it stops anyway. 0 = unlimited, which is what
+        #    "just keep going" means and also what will drive into a river
+        #    given a long enough blackout - set a real budget if the route
+        #    goes anywhere near water or a drop.
+        self.blind_creep_speed = config.get('blind_creep_speed', 0.0)
+        self.blind_creep_max_dist_m = config.get('blind_creep_max_dist_m', 0.0)
+        self._blind_anchor_xy = None      # where the current blind stretch began
+        self._blind_budget_spent = False  # so the "budget exhausted" line prints once
         # the OAK pipeline takes several seconds to boot, during which
         # last_obstacle/left_dist/right_dist above still hold their
         # "assume clear" init values - stay stopped in on_pose2d until the
@@ -1666,6 +1892,57 @@ class TulakObstacle(Node):
             return False
         return True
 
+    def _track_baseline_heading(self):
+        """Accumulate how much last_heading has wandered since the current
+        GPS baseline anchor was set. Called once per pose2d cycle.
+
+        Kept as an incremental circular min/max around the first sample of
+        the window rather than a list of samples - a baseline can span many
+        seconds at 10Hz, and only the extremes matter. A turn beyond +-180deg
+        would alias, but such a leg is nowhere near straight and gets
+        rejected on the spread anyway."""
+        if self._last_commanded_speed < -0.01:
+            self._baseline_had_reverse = True
+        if self._baseline_ref_heading is None:
+            self._baseline_ref_heading = self.last_heading
+            self._baseline_dmin = 0.0
+            self._baseline_dmax = 0.0
+            return
+        delta = normalize_angle(self.last_heading - self._baseline_ref_heading)
+        self._baseline_dmin = min(self._baseline_dmin, delta)
+        self._baseline_dmax = max(self._baseline_dmax, delta)
+
+    def _reset_baseline_heading(self):
+        """Start a fresh window - called whenever the GPS baseline anchor
+        moves, so each leg is judged only on its own heading history."""
+        self._baseline_ref_heading = self.last_heading
+        self._baseline_dmin = 0.0
+        self._baseline_dmax = 0.0
+        self._baseline_had_reverse = False
+
+    def _baseline_heading_spread(self):
+        """Total heading wander across the current baseline, radians."""
+        return self._baseline_dmax - self._baseline_dmin
+
+    def _baseline_was_straight(self):
+        """Is this leg's GPS chord bearing usable as a stand-in for where
+        the robot was actually pointing? Two ways it can fail:
+
+          - the robot turned during the leg, so the chord is not any
+            heading it actually held (compass_calibration_max_spread)
+          - the robot REVERSED during the leg, in which case the chord
+            points roughly opposite to where it was facing. This one is
+            invisible to the spread test - backing up in a straight line
+            is perfectly "straight" - and teaching it to the compass is
+            worth a half turn of error."""
+        if self._baseline_had_reverse:
+            return False
+        if self.compass_calibration_max_spread <= 0:
+            return True  # spread gate disabled (the reverse check still applies)
+        if self._baseline_ref_heading is None:
+            return False  # no heading history for this leg - don't guess
+        return self._baseline_heading_spread() <= self.compass_calibration_max_spread
+
     def _update_compass_calibration(self, trusted_gps_heading):
         """Learns compass_offset - the additive correction (magnetic
         declination + any mount misalignment) between the raw geometric
@@ -1729,13 +2006,22 @@ class TulakObstacle(Node):
                     # _smooth_heading and item 9 at top of file)
                     self.travel_heading = self._smooth_heading(initial_bearing(*self.last_gps_pos, lat, lon))
                     self.last_gps_pos = (lat, lon)
-                    if self.use_compass_heading and self._gps_fix_quality_ok(data):
+                    straight = self._baseline_was_straight()
+                    if (self.use_compass_heading and self.compass_learn_offset
+                            and self._gps_fix_quality_ok(data) and straight):
                         # right when travel_heading is at its most
-                        # trustworthy (baseline-confirmed, quality-gated)
-                        # - see _update_compass_calibration
+                        # trustworthy (baseline-confirmed, quality-gated,
+                        # AND driven straight - see _baseline_was_straight;
+                        # without that last one a curved leg's chord bearing
+                        # gets taught to the compass as if it were a heading)
                         self._update_compass_calibration(self.travel_heading)
+                    elif self.use_compass_heading and self.compass_learn_offset and not straight:
+                        self.compass_cal_skipped += 1
+                    # each leg is judged on its own heading history
+                    self._reset_baseline_heading()
             else:
                 self.last_gps_pos = (lat, lon)
+                self._reset_baseline_heading()  # first anchor - start the window here
             if not had_heading and self.travel_heading is not None:
                 print(self.time, 'GPS heading established: %.0f deg' % math.degrees(self.travel_heading))
 
@@ -1848,10 +2134,18 @@ class TulakObstacle(Node):
 
         if not self.depth_blind_active and self.blind_streak >= self.blind_confirm_frames:
             self.depth_blind_active = True
+            # a fresh blind stretch gets a fresh distance budget - see
+            # blind_creep_max_dist_m
+            self._blind_anchor_xy = None
+            self._blind_budget_spent = False
+            plan = ('creeping forward at %.2f m/s' % self.blind_creep_speed
+                    if self.blind_creep_speed > 0 else 'holding still')
             print(self.time, 'depth camera is blind (centre invalid, %.0f%% of the profile unknown) - '
-                              'holding still until it recovers' % (100 * (1 - valid_frac)))
+                              '%s until it recovers' % (100 * (1 - valid_frac), plan))
         elif self.depth_blind_active and self.blind_clear_streak >= self.blind_clear_frames:
             self.depth_blind_active = False
+            self._blind_anchor_xy = None
+            self._blind_budget_spent = False
             print(self.time, 'depth data recovered (%.0f%% of the profile valid) - resuming'
                    % (100 * valid_frac))
 
@@ -2322,6 +2616,32 @@ class TulakObstacle(Node):
         magnitude = self.edge_correction_min_rad + severity * (self.edge_correction_max_rad - self.edge_correction_min_rad)
         return -magnitude if left_blocked else magnitude  # away from whichever edge is blocked
 
+    def _blind_command(self, xy, dt):
+        """(speed, steering) to use while the depth camera is blind - see
+        the blind-behaviour notes in __init__. Returns a dead stop unless
+        blind_creep_speed is set AND creeping is currently allowed."""
+        if self.blind_creep_speed <= 0:
+            return 0.0, 0.0
+        if self.state != State.DRIVE:
+            # blind partway through an avoidance maneuver: whatever
+            # triggered it was real, and it is still out there
+            return 0.0, 0.0
+        if self._blind_anchor_xy is None:
+            self._blind_anchor_xy = xy
+        if self.blind_creep_max_dist_m > 0:
+            travelled = math.hypot(xy[0] - self._blind_anchor_xy[0],
+                                   xy[1] - self._blind_anchor_xy[1])
+            if travelled >= self.blind_creep_max_dist_m:
+                if not self._blind_budget_spent:
+                    self._blind_budget_spent = True
+                    print(self.time, 'blind creep budget spent (%.1fm with no usable depth) - '
+                                      'stopping until it recovers' % travelled)
+                return 0.0, 0.0
+        # steering degrades to road mask + GPS bearing by itself here -
+        # _depth_confidence() is 0 with an all-unknown profile, so the
+        # depth term drops out of _drive_steering's blend
+        return min(self.blind_creep_speed, self.max_speed), self._drive_steering(dt)
+
     def _polar_bin(self, world_heading):
         """Bin index for an absolute heading (last_heading convention)."""
         frac = ((world_heading + math.pi) % (2 * math.pi)) / (2 * math.pi)
@@ -2748,6 +3068,11 @@ class TulakObstacle(Node):
             parts.append('gps_travel_heading=%.0fdeg' % math.degrees(self.travel_heading))
         if self.compass_offset is not None:
             parts.append('compass_offset=%.1fdeg' % math.degrees(self.compass_offset))
+        if self.compass_cal_skipped:
+            # legs rejected as too curved to learn from (item 23) - if this
+            # climbs while compass_offset never settles, the robot is simply
+            # never driving straight long enough to calibrate
+            parts.append('cal_skipped=%d' % self.compass_cal_skipped)
         if self.target_lat is not None:
             parts.append('target=(%.6f,%.6f)' % (self.target_lat, self.target_lon))
             parts.append('bearing=%.0fdeg dist=%.1fm' % (math.degrees(self.bearing_to_target), self.target_dist))
@@ -2982,6 +3307,11 @@ class TulakObstacle(Node):
         # this method or any other reads it.
         self._update_polar_memory(xy)
         self._log_polar_memory(xy)
+        # accumulate heading wander for the current GPS baseline - decides
+        # whether that leg may teach the compass (item 23). Bookkeeping
+        # only, and deliberately before the early returns below so a leg
+        # spanning a stop is still judged on its full history.
+        self._track_baseline_heading()
 
         if not self.have_obstacle_data:
             # camera pipeline still booting (OAK-D Pro typically takes a
@@ -2994,15 +3324,18 @@ class TulakObstacle(Node):
 
         if self.depth_blind_active:
             # the camera is returning essentially nothing - see
-            # _update_blind_state. Hold still: do NOT hand this to the
-            # avoidance state machine, which would read the centre's 0.0
-            # fail-safe as an obstacle and answer by reversing, i.e. by
-            # moving in the one direction nothing watches at all. Placed
-            # ahead of every other hold because it is the most fundamental
-            # of them: the others act on what was sensed, this one applies
-            # when nothing was.
-            self._last_commanded_speed = 0.0
-            self.send_speed_cmd(0, 0)
+            # _update_blind_state. Do NOT hand this to the avoidance state
+            # machine, which would read the centre's 0.0 fail-safe as an
+            # obstacle and answer by reversing, i.e. by moving in the one
+            # direction nothing watches at all. Placed ahead of every other
+            # hold because it is the most fundamental of them: the others
+            # act on what was sensed, this one applies when nothing was.
+            # Whether this stands still or crawls forward is
+            # blind_creep_speed - see _blind_command.
+            speed, steering_angle = self._blind_command(xy, dt)
+            self._last_commanded_speed = speed
+            self._last_commanded_steering = steering_angle
+            self.send_speed_cmd(speed, steering_angle)
             return
 
         if self.ground_hazard_active:
