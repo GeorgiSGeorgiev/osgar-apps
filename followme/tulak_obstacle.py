@@ -838,6 +838,50 @@
       risk this exists to remove - but it means a nose-in-a-bush stall
       needs a human or a manual nudge rather than recovering itself.
 
+  27. Blindness detection no longer keys off the centre reading. It used
+      to require "centre == 0.0", the sentinel an untrusted window
+      reported - but obstdet3d_zones' center_fail_dist_m makes that value
+      configurable, so raising it for a competition run (accepting that
+      missing data no longer stops the robot) would ALSO have silently
+      disabled blindness detection, and with it the blind hold and creep.
+      Those two decisions must stay independent: one is "how much risk am
+      I taking when the camera cannot see", the other is "can the camera
+      see at all". _update_blind_state now uses depth_profile validity
+      plus the ground band only, both of which are unaffected by the fail
+      value. Same detections on the logs either way.
+
+  26. Three fixes from the 2026-08-29 Stromovka analysis:
+
+      (a) Course over ground from the receiver (use_gps_course). The GPS
+      had been sending RMC once a second all along, carrying its own
+      course, and osgar discarded every one - split_buffer only ever
+      searched for GGA, so RMC never even left the serial buffer. Now
+      parsed and merged into nmea_data as cog/sog. It beats fix
+      differencing on steadiness roughly 3:1 (median change between
+      consecutive 1Hz samples 2.83deg vs 8.43deg) and needs no baseline
+      distance, no straight-line assumption and no reverse gate, since it
+      is an instantaneous direction of travel rather than a chord averaged
+      over whatever the robot did between two fixes. Used as a heading
+      source below the compass, and preferred over travel_heading for
+      teaching compass_offset. Only available while moving - 40% of logged
+      fixes carried a usable cog - so travel_heading stays as the fallback.
+
+      (b) min_real_frac in obstdet3d_zones - see there. Stops the far-mask
+      supplying a confident distance for a window holding no measurement
+      at all, which is what let run 125548 read 15.00m into a frontal
+      collision. Measured on the logs: false-far centre readings 0.8% ->
+      0.2% on that run, with the fail-safe rate rising 0.0-0.6pp and
+      not moving at all on a healthy run.
+
+      (c) The ground band now vetoes the blind hold
+      (blind_ground_valid_frac). The centre and profile windows sit near
+      the horizon and legitimately go blank facing open sky, which is not
+      blindness; the ground band a metre ahead is present in any drivable
+      scene. Run 130657 spent 14s creeping "blind" while the ground band
+      read 60-62% valid the whole time. With the veto that run drops from
+      2.3% blind in 9 episodes to 0.7% in 1, while the genuinely blind
+      sunny-bridge run (ground band also at 0.0%) is unchanged at ~74%.
+
   25. Compass can now run without GPS correction at all
       (compass_offset_deg / compass_learn_offset - see __init__).
       compass_offset corrects declination plus a fixed mount rotation;
@@ -931,7 +975,146 @@
       single scalar offset can correct - see the compass notes for what
       that would take.
 
-  All new config keys (escape_after_cycles, escape_progress_dist_m,
+  28. OSM route following. New optional mode, switched on entirely from
+      the config JSON by adding an osm_router:OSMRouter module and linking
+      its 'route_hint' output to this node - see
+      config/matty-tulak-osm.json. With no such module wired, route_mode
+      stays False and NOTHING in this file behaves differently; every
+      branch that reads it is skipped. That is the only safety argument
+      that matters here, because the avoidance behaviour this mode sits on
+      top of took twenty-seven items above to get right.
+
+      The problem it fixes is not in the follower, it is in the target.
+      Item 5's GPS following steers at the final destination, and a
+      bearing to a destination 200m away points straight through whatever
+      is in between - which in a park is a lawn. Replayed against the real
+      OSM data for Stromovka, the 2026-08-29 runs show exactly that: the
+      median fix sits 1.25m from a mapped path, but three separate
+      episodes have the robot 6-35m out on the grass, held for 20-60s at a
+      time, and one whole run (125548) averaged ~14m off-path. Those are
+      not fix noise; noise does not hold a direction for a minute.
+
+      So the router plans a path over the mapped, drivable way network and
+      hands this node a rolling aim point a few meters ahead ON that path.
+      Every existing mechanism - bearing_to_target, the blend against
+      last_dir, the depth terms, the whole avoidance state machine and its
+      priority over all of the above - is reused unchanged. The four
+      places this file actually differs:
+
+      (a) on_route_hint sets target_lat/target_lon from the aim point
+          instead of from a QR code, and takes 'arrived' from the router.
+          on_qr_code is then not wired at all in route mode - the router
+          reads the QR itself, since it is the thing that needs to plan.
+      (b) _bearing_distance_scale reads the router's remaining-distance
+          ALONG THE ROUTE rather than target_dist, which in route mode is
+          only ever about one lookahead and would otherwise fade the
+          bearing to nothing for the entire run.
+      (c) _drive_steering takes the bearing weight from the router's
+          'authority' instead of from the road-fraction gate. Low on a
+          straight path (the RedRoad mask centres better than a 1-3m GPS
+          fix), high approaching and leaving a junction (the mask has no
+          opinion about WHICH branch leads to the target - that is the one
+          question only the map can answer), high while recovering from a
+          confirmed excursion. This is the answer to "do I trust the
+          network or the compass more": neither, everywhere - each one
+          where it is the better instrument.
+      (d) on_pose2d caps forward speed on the router's 'hold', which is
+          what makes the robot wait at the start line until the QR is
+          read (route_hold_creep_speed, 0.0 = stand still) and stop on
+          arrival / when lost. Deliberately a cap on the finished command
+          rather than an early return, so obstacle avoidance keeps full
+          authority underneath it.
+
+      (e) on_emergency_stop now RECORDS the button state instead of only
+          acting on it once, and on_pose2d holds speed at 0 for as long as
+          it is engaged - ahead of every other hold in this file,
+          including the blind hold, because a human with a finger on a
+          button outranks anything sensed. This only matters with
+          terminate_on_stop=False, which the OSM config uses so that the
+          press/release cycle can act as a mode reset (release returns the
+          router to WAITING - see the QR command protocol in
+          osm_router.py). With terminate_on_stop=True, unchanged: the
+          exception ends the run on the press exactly as before, and the
+          new hold is never reached.
+
+          The reason the hold has to exist at all: with the run no longer
+          terminating, nothing else would stop on_pose2d commanding a
+          speed again on the very next cycle. Whether the ESP32 refuses
+          motion while its own EMERGENCY_STOP status is set is not
+          something this file can verify, so it does not rely on it.
+
+      Note what is NOT delegated: nothing about safety. The router never
+      sees a depth reading and cannot relax a threshold, start a maneuver,
+      or suppress a stop. Its worst possible failure is pointing the
+      bearing somewhere unhelpful, which the unchanged avoidance layer
+      handles the same way it handles a bad bearing today.
+
+  29. The road mask cannot bring Matty back to the road, and this is
+      measured, not assumed. Two numbers off the 2026-08-29 Stromovka
+      logs, both reproducible via replay_osm_router.py:
+
+      (a) While 1-8m off the planned corridor, the mask steered back
+      toward it in only 40-48% of frames - worse than a coin flip - with a
+      mean contribution of -0.7 to -1.0deg, i.e. very slightly AWAY. It is
+      a lane-KEEPING sensor with no notion of WHICH lane. Once Matty is on
+      the grass and the grass reads drivable, nothing in on_nn_mask ever
+      says "the road is over there". That is the whole mechanism behind
+      the field report of Matty turning toward a lawn and continuing onto
+      it, and no amount of tuning the mask fixes it, because the mask is
+      not wrong - it is answering a different question.
+
+      (b) The mask degrades predictably with camera-to-road misalignment.
+      Within 15deg of the road axis it fragments into multiple blobs in
+      27% of frames and its whole-mask centroid (mask_center averages ALL
+      drivable pixels) lands >10% of half-width from the largest blob in
+      7%. At 45-60deg off-axis: 51% and 30%. That 4x rise is exactly the
+      failure where the centroid sits between a real road blob and a lawn
+      blob and points at neither - and 45-60deg off-axis is the state an
+      avoidance turn leaves the robot in.
+
+      Tested and REJECTED on the same data: taking the largest connected
+      component, or the component nearest the bottom-centre of the frame,
+      instead of the global centroid. Neither beat the plain centroid
+      against a map-derived reference, including on fragmented frames.
+      The centroid is not the problem; the absence of any road-anchored
+      reference is. Noted so it is not re-attempted.
+
+      Three consequences, all inside route mode (item 28), all inert
+      without a router wired:
+
+      - _mask_trust() fades last_dir out as the camera swings off the
+        mapped road axis, between mask_trust_full_deg and
+        mask_trust_none_deg. The mask says less exactly where it is
+        measurably least reliable.
+      - _route_corridor_bias() adds a slow, heavily smoothed cross-track
+        + heading-error term in 'corridor' mode - ADDITIVE, not blended.
+        A blend lets the mask cancel the only restoring signal available;
+        an addition cannot be outvoted, it shifts the equilibrium the mask
+        settles into while leaving it in charge of the fast corrections it
+        is genuinely good at. Gains are deliberately gentle (3deg per
+        metre, capped at 15deg): GPS is the LOW-frequency term here and
+        must never turn a noisy fix into a sharp correction.
+      - the route's steering ceiling is now situational rather than
+        turn_angle everywhere. turn_angle (20deg) is the right ceiling for
+        a cruising correction and the wrong one for a T junction: at 20deg
+        Matty's turning radius is 0.16/tan(10deg) = 0.91m, so a 90deg turn
+        needs 1.4m of arc and swings wide across the corner; at the 40deg
+        the router asks for near a junction it is 0.44m. _rate_limit_
+        steering also takes the router's rate as a RELAXATION only (never
+        a tightening), because winding on 40deg at the cruising 30deg/s
+        would consume most of the junction.
+
+      Why this is safe to add on top of twenty-eight items of tuned
+      behaviour: none of it can start, suppress or relax a maneuver.
+      _drive_steering is only ever reached when the avoidance state
+      machine has already declined to act, the depth thresholds are
+      untouched, and every new term is bounded (mask_trust in [0.25,1],
+      bias in +-15deg, steer limit <= the platform's own 45deg cap).
+
+  All new config keys (route_hold_creep_speed, route_cross_track_gain_deg_per_m,
+  route_heading_gain, route_bias_max_deg, route_bias_alpha, mask_trust_full_deg,
+  mask_trust_none_deg, mask_trust_min, route_min_road_frac, route_veto_authority,
+  escape_after_cycles, escape_progress_dist_m,
   escape_backup_time_boost, ground_hazard_confirm_frames,
   terminate_on_ground_hazard, follow_gps_target,
   gps_heading_min_baseline_m, waypoint_arrival_dist_m,
@@ -987,6 +1170,39 @@ def mask_center(mask):
     return tuple(int(x) for x in indices.mean(axis=0))
 
 
+def weighted_mask_center_x(mask, sky_row):
+    """Horizontal centre of the drivable mask, weighting the NEAR rows
+    (bottom of the frame) more than the far ones.
+
+    Why weight rather than crop (item 32). A hard "focus window" was the
+    obvious idea and it measures WORSE: over 44623 recorded frames a fixed
+    mid-frame band raised the frame-to-frame centroid jitter from 2.34px to
+    2.61px and went completely empty - no steering signal at all - in 2.5%
+    of frames. A weighting cannot go blind, and it does not stop the robot
+    reacting to a road that is only visible far away or off to one side,
+    which is exactly what a crop would.
+
+    A ramp still earns its place: the drivable fraction rises from 0.03
+    just under the sky cut to 0.81 at the bottom of the frame, so the far
+    rows contribute little signal but carry most of the noise - they are
+    where pitch error moves the horizon and where an out-of-distribution
+    view (see item 29) invents road on a lawn. Weighting them down cuts
+    jitter to 2.15px, an 8% improvement, and shifts the centroid by only
+    0.95px at the median, so it does not re-decide ordinary steering.
+
+    Falls back to the frame centre on an empty mask, same as
+    mask_center()."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return mask.shape[1] / 2.0
+    span = max(1, mask.shape[0] - sky_row)
+    weights = (ys - sky_row) / float(span)
+    total = weights.sum()
+    if total <= 0:
+        return float(xs.mean())
+    return float((xs * weights).sum() / total)
+
+
 def normalize_angle(angle):
     """wrap to (-pi, pi]"""
     return (angle + math.pi) % (2 * math.pi) - math.pi
@@ -1038,6 +1254,35 @@ def parse_gps_qr(text):
         r'(\d{1,3})[°]\s*(\d{1,2})[\'′]\s*([\d.]+)["″]\s*([NS])[,\s]+'
         r'(\d{1,3})[°]\s*(\d{1,2})[\'′]\s*([\d.]+)["″]\s*([EW])',
         text)
+    if m is None:
+        # Decimal degrees carrying a hemisphere letter, prefixed or
+        # suffixed: "50.1299558N, 14.3793860E", "N50.12, E14.38".
+        # Deliberately tried AFTER both forms above so neither changes
+        # behaviour - the plain-decimal branch already handles anything
+        # without letters, and this pattern cannot match a DMS string
+        # (the closing " sits between the seconds and the hemisphere).
+        #
+        # Field case (2026-09-04 CZU runs 174623/174729/175216): three
+        # codes in this exact format decoded perfectly and were then
+        # silently discarded as "no coordinates", so the robot ignored a
+        # target that had been shown to it correctly.
+        decimal = r'(?:([NSEW])\s*)?(-?\d{1,3}\.\d+)\s*(?:([NSEW])\s*)?'
+        m2 = re.search(decimal + r',\s*' + decimal, text)
+        if m2:
+            pair = [(float(m2.group(2)), m2.group(1) or m2.group(3)),
+                    (float(m2.group(5)), m2.group(4) or m2.group(6))]
+            # the letters also say WHICH coordinate is which, so
+            # "14.38E, 50.13N" is unambiguous - un-swap it. Without
+            # letters, keep the conventional latitude-first order.
+            if pair[0][1] in ('E', 'W') and pair[1][1] in ('N', 'S'):
+                pair.reverse()
+            (lat, lat_hemi), (lon, lon_hemi) = pair
+            if lat_hemi == 'S':
+                lat = -abs(lat)
+            if lon_hemi == 'W':
+                lon = -abs(lon)
+            if abs(lat) <= 90 and abs(lon) <= 180:
+                return lat, lon
     if m:
         d1, mi1, s1, hemi1, d2, mi2, s2, hemi2 = m.groups()
         lat = float(d1) + float(mi1) / 60 + float(s1) / 3600
@@ -1206,6 +1451,9 @@ class TulakObstacle(Node):
         self.realign_tolerance = math.radians(config.get('realign_tolerance_deg', 5))
 
         self.raise_exception_on_stop = config.get('terminate_on_stop', True)
+        # see on_emergency_stop - only consulted when terminate_on_stop is
+        # False, since otherwise the run ends on the press
+        self.emergency_stop_active = False
 
         # stuck / escape-mode detection (see notes at top of file)
         self.escape_after_cycles = config.get('escape_after_cycles', 3)
@@ -1382,6 +1630,31 @@ class TulakObstacle(Node):
         self.compass_offset = (math.radians(fixed_offset_deg)
                                 if fixed_offset_deg is not None else None)
         self.compass_last_calibrated = None  # self.time of the last calibration update, diagnostics only
+        # --- hard-iron correction (item 30) ---
+        # compass_offset above is a single number, and a single number
+        # provably cannot fix this compass. Fitted over 485 straight-line
+        # samples from the 2026-09-04 CZU runs against the receiver's own
+        # course over ground:
+        #
+        #     error = +7.5 deg  +  10.9 deg * cos(heading - 6 deg)
+        #
+        # The constant is declination plus mount rotation - that is what
+        # compass_offset_deg is for, and 6.1 was a good estimate of it. The
+        # 10.9 deg term VARIES WITH HEADING, which is hard iron: something
+        # ferrous on the robot itself, turning with it. No offset removes
+        # it, and it is the dominant error - residual against the constant
+        # alone is a median 7.7 deg / p90 14.1 deg, against constant plus
+        # this term 2.6 deg / 7.3 deg. Three times better.
+        #
+        # Drift within a run was only +-3 deg over 150-300s, so the compass
+        # is steady; it is simply biased in a direction-dependent way.
+        #
+        # Re-fit with fit_compass.py after ANY change to what is mounted on
+        # the robot - the August logs gave 5.6 deg at phase 19 deg for the
+        # same constant, so this term does move when the hardware does.
+        # 0 disables (single-offset behaviour, as before).
+        self.compass_hardiron = math.radians(config.get('compass_hardiron_deg', 0.0))
+        self.compass_hardiron_phase = math.radians(config.get('compass_hardiron_phase_deg', 0.0))
 
         self.target_lat = None
         self.target_lon = None
@@ -1389,8 +1662,125 @@ class TulakObstacle(Node):
         self.bearing_to_target = None
         self.last_gps_pos = None  # (lat, lon) of the last fix used as a heading baseline
         self.travel_heading = None  # radians, compass convention - see initial_bearing()
+
+        # --- course over ground from the receiver (item 26) ---
+        # The GPS was already sending RMC once a second carrying its own
+        # course over ground, and osgar was discarding it (split_buffer only
+        # ever searched for GGA). Now parsed and merged into nmea_data as
+        # 'cog'/'sog' - see osgar/drivers/gps.py parse_rmc.
+        #
+        # This is a better heading than travel_heading in every respect: the
+        # receiver derives it from its velocity solution rather than from
+        # the chord between two fixes, so it needs no baseline distance, no
+        # straight-line assumption and no reverse-motion gate - all of which
+        # exist purely to make position-differencing survivable. Measured
+        # over the 2026-08-29 logs, median change between consecutive 1Hz
+        # samples: 2.83deg for cog against 8.43deg for a 1-second chord.
+        #
+        # It has one genuine limitation: course comes from velocity, so at a
+        # standstill there is none. The receiver reports it empty then, and
+        # gps_course_min_speed additionally ignores it below a speed where
+        # it would be mostly noise. Only 40% of the logged fixes carried a
+        # usable cog, precisely because Matty spends a lot of time stopped
+        # or crawling - so this supplements travel_heading, it does not make
+        # the fallback chain redundant.
+        self.use_gps_course = config.get('use_gps_course', True)
+        self.gps_course_min_speed = config.get('gps_course_min_speed', 0.2)
+        self.gps_course = None       # radians, compass convention
+        self.gps_course_time = None  # self.time it was received
+        self.gps_course_max_age = datetime.timedelta(
+            seconds=config.get('gps_course_max_age_sec', 3.0))
         self.waypoint_reached = False
         self.last_gps_log_time = None
+        # Every fix, unconditionally - unlike last_gps_pos, which only
+        # advances once the robot has covered gps_heading_min_baseline_m
+        # and so can be several meters and several seconds stale by
+        # design. on_route_hint needs the CURRENT position to turn an aim
+        # point into a bearing at 10Hz, and must not use the baseline
+        # anchor for that.
+        self.last_fix = None
+
+        # --- OSM route following (item 28 at top of file) ---
+        # Everything below is inert until an osm_router:OSMRouter node is
+        # wired into 'route_hint'. With no such node this file behaves
+        # exactly as before: route_mode stays False and every branch that
+        # reads it is skipped.
+        #
+        # What changes when it IS wired: target_lat/target_lon stop being
+        # the final destination from a QR code and become a rolling aim
+        # point a few meters ahead on a planned, mapped path. All of the
+        # bearing machinery below is reused unchanged - the improvement is
+        # entirely in WHERE the target is, not in how it is followed.
+        self.route_mode = False
+        self.route_state = 'none'
+        self.route_authority = None    # 0..1, how much the router wants the bearing trusted
+        self.route_remaining_m = None  # along-route distance to the FINAL destination
+        self.route_cross_track_m = None
+        self.route_hold = None         # None | 'creep' | 'stop' - see on_pose2d
+        self.route_guidance_mode = None    # 'corridor' | 'junction' | 'recovery'
+        self.route_road_bearing = None     # radians, compass - which way the mapped path runs here
+        self.route_steer_limit = None      # radians, this situation's steering ceiling
+        self.route_steer_rate = None       # rad/s, this situation's rate ceiling
+        self.route_speed_limit = None      # m/s, or None
+        self.route_plan_seq = None
+
+        # --- corridor bias (item 29) ---
+        # In 'corridor' mode the route is applied as a small ADDITIVE bias
+        # on top of the mask/depth steering rather than blended against it.
+        # The reason is measured, not stylistic: over the 2026-08-29
+        # Stromovka logs, while 1-8m off the planned corridor the road mask
+        # steered back toward it only 40-48% of the time (mean contribution
+        # -0.7 to -1.0deg, i.e. very slightly AWAY). The mask is a
+        # lane-KEEPING sensor with no notion of which lane, so it supplies
+        # no restoring signal at all - and a blend lets it dilute or cancel
+        # the one signal that does. A bias cannot be outvoted; it shifts
+        # the equilibrium the mask settles into.
+        #
+        # Gains are deliberately gentle. GPS position noise is bounded but
+        # real (1-3m), so this must never translate a noisy fix into a
+        # sharp correction - it is the LOW-FREQUENCY term, and the mask
+        # keeps the fast one.
+        self.route_cross_track_gain = math.radians(
+            config.get('route_cross_track_gain_deg_per_m', 3.0))
+        self.route_heading_gain = config.get('route_heading_gain', 0.35)
+        self.route_bias_max = math.radians(config.get('route_bias_max_deg', 15.0))
+        self.route_bias_alpha = config.get('route_bias_alpha', 0.15)
+        self._route_bias = 0.0
+
+        # --- how much the road mask is worth right now (item 29) ---
+        # Measured on the same logs: with the camera within 15deg of the
+        # road axis the mask fragments into multiple blobs in 27% of frames
+        # and its whole-mask centroid lands >10% of half-width away from
+        # the largest blob in 7%. At 45-60deg off-axis those become 51% and
+        # 30% - a 4x increase in exactly the failure where the centroid
+        # sits between a real road blob and a lawn blob, pointing at
+        # neither. That is the state an avoidance turn leaves the robot in.
+        # So the mask's contribution is faded out by how far the camera is
+        # pointing off the mapped road axis, and the route bias above picks
+        # up what it drops.
+        self.mask_trust_full_deg = config.get('mask_trust_full_deg', 25.0)
+        self.mask_trust_none_deg = config.get('mask_trust_none_deg', 60.0)
+        self.mask_trust_min = config.get('mask_trust_min', 0.25)
+        # Safety net replacing the road-fraction gate in junction mode: if
+        # the mask sees essentially NO drivable surface the way the route
+        # wants to go, something is wrong (bad fix, wrong branch, map
+        # error) and the route should not command a hard turn into it.
+        # Deliberately a veto at a very low threshold rather than the old
+        # proportional gate, which would have blocked legitimate turns
+        # toward a branch sitting at the edge of the frame.
+        self.route_min_road_frac = config.get('route_min_road_frac', 0.02)
+        # what the route's authority is cut to when that veto fires - not
+        # zero, because "the mask sees nothing that way" is also what a
+        # blinded or badly-lit frame looks like, and the map is then the
+        # better of two poor witnesses
+        self.route_veto_authority = config.get('route_veto_authority', 0.3)
+        # What "hold: creep" means for this robot. 0.0 = stand still until
+        # the router has a plan (i.e. until the start QR has been read),
+        # which is the safe default: crawling forward before knowing where
+        # the target is can only take the robot somewhere it then has to
+        # come back from. Set it to a small value (<= min_speed) if you
+        # would rather Matty inch forward while waiting.
+        self.route_hold_creep_speed = config.get('route_hold_creep_speed', 0.0)
 
         # obstacle zones (from ObstacleDetector3DZones)
         self.last_obstacle = float('inf')  # center distance, meters
@@ -1439,6 +1829,24 @@ class TulakObstacle(Node):
         # possible close object.
         self.blind_hold_enabled = config.get('blind_hold_enabled', True)
         self.blind_profile_valid_frac = config.get('blind_profile_valid_frac', 0.25)
+        # The ground band is the "is the camera alive at all?" test. The
+        # centre/profile windows sit near the horizon, so they legitimately
+        # go blank whenever the robot faces open sky or a long view - which
+        # is NOT blindness, and holding for it wastes time. The ground band
+        # looks at the floor a metre or two ahead, which is present in
+        # every scene Matty can drive in; if it still returns data, the
+        # camera is working.
+        #
+        # Both 2026-08-29 mid-run "blind" episodes, side by side:
+        #   130657 t=576-591: upper frame 65% -> 2.1% valid, GROUND STAYED
+        #     60-62% the whole time. Camera fine, robot just facing open
+        #     distance - 14s of creeping for nothing.
+        #   133946 (sunny bridge): upper 62% -> 0.1% AND ground 0.5% ->
+        #     0.0%. Genuinely nothing anywhere - water, bright smooth deck
+        #     and low sun give stereo no texture at all.
+        # Only the second is blindness. This threshold separates them.
+        self.blind_ground_valid_frac = config.get('blind_ground_valid_frac', 0.10)
+        self.ground_valid_frac = None  # latest from on_ground_hazard, kept even when the hazard reaction is off
         self.blind_confirm_frames = config.get('blind_confirm_frames', 3)
         self.blind_clear_frames = config.get('blind_clear_frames', 3)
         self.depth_blind_active = False
@@ -1497,6 +1905,10 @@ class TulakObstacle(Node):
         self.have_obstacle_data = False
 
         # road following
+        # Weight near rows over far ones when locating the road centre -
+        # see weighted_mask_center_x. False restores the plain centroid of
+        # every drivable pixel below the sky cut.
+        self.mask_row_weighting = config.get('mask_row_weighting', True)
         self.last_dir = 0  # steering angle (rad), from nn_mask
         self.left_road_frac = 0.5
         self.right_road_frac = 0.5
@@ -1709,6 +2121,61 @@ class TulakObstacle(Node):
         # cycle. Past max_bumper_hits with no real progress since, gives
         # up and stops for good - same "don't keep trying forever"
         # pattern as ground_hazard/max_backup_time/max_turn_time.
+        # --- tail swing (item 31) ---
+        # Matty is CENTRE-ARTICULATED (matty.py: radius =
+        # (0.32/2)/tan(joint/2), joint in the middle), so steering one way
+        # swings the rear body the OTHER way. An avoidance turn away from
+        # an obstacle therefore sweeps the tail TOWARD it - and by the time
+        # the robot is drawing level, the forward-looking depth zones have
+        # already lost sight of it.
+        #
+        # Measured over the 2026-08-29 and 2026-09-04 runs, on forward
+        # cycles commanding 15deg or more:
+        #                       tail side <0.8m     ...seen live
+        #     TURNING              67.9%               36.6%
+        #     REALIGNING           41.7%                7.1%
+        # i.e. in a third of hard-turn cycles there was something the tail
+        # was swinging into that the camera could no longer see. Median
+        # remembered clearance 0.43m, minimum 0.32m. That is the reported
+        # "turns hard right after bypassing an obstacle and the rear wheels
+        # catch it", and it is a flipping risk, not just a scrape.
+        #
+        # Two parts. A short per-flank memory supplies what the live zones
+        # cannot (nothing looks sideways or back), and the steering
+        # amplitude is then capped so the swept corner stays clear.
+        self.tail_swing_enabled = config.get('tail_swing_enabled', True)
+        # Chassis geometry, MEASURED 2026-09-05 (see _corner_swing_limit):
+        # boxes 17.5x22.5cm with a 14.5cm gap and the joint at its centre,
+        # 3cm bumpers, wheels adding 6.5cm each side -> 35.5cm wide,
+        # 55.5cm long. Everything below follows from those numbers; change
+        # them only if the robot changes.
+        self.rear_corner_radius_m = config.get('rear_corner_radius_m', 0.329)
+        self.rear_corner_angle = math.radians(config.get('rear_corner_angle_deg', 32.6))
+        self.swing_margin_m = config.get('swing_margin_m', 0.10)
+        self.swing_min_steering = math.radians(config.get('swing_min_steering_deg', 10))
+        # The side zones report RANGE to something in a forward-DIAGONAL
+        # sector, not lateral clearance. obstdet3d_zones' left/right
+        # columns sit roughly 11-29 deg off the axis, so a reading of R
+        # metres is about R*sin(20deg) laterally and R*cos(20deg) ahead.
+        # Using the range directly as clearance - which is the obvious
+        # mistake here - would overstate the room by about 3x.
+        self.side_zone_bearing = math.radians(config.get('side_zone_bearing_deg', 20.0))
+        # Effective distance from the articulation joint to the outer rear
+        # corner - what actually sweeps. NOT measured on the real chassis:
+        # 0.35m is half the wheelbase plus an assumed body overhang. Check
+        # it against the real robot; too small silently disables the guard,
+        # too large just makes turns more conservative in tight spots.
+        # Never clamp below this: the robot still has to be able to
+        # maneuver out of a tight spot, and a guard that forbids turning
+        # entirely would just trade a scrape for being stuck. Below this,
+        # the existing side hard-stop and backup logic take over.
+        # How long, and how far, a flank reading stays relevant. Both
+        # bounds matter: the memory describes the world in the robot's own
+        # frame, so it stops being true once the robot has moved on.
+        self.flank_memory_time = datetime.timedelta(seconds=config.get('flank_memory_sec', 6.0))
+        self.flank_memory_dist_m = config.get('flank_memory_dist_m', 2.0)
+        self._flank_history = {-1: deque(), 1: deque()}  # key: +1 = left side, -1 = right
+
         self.max_bumper_hits = config.get('max_bumper_hits', 3)
         self.bumper_hit_streak = 0
         self.bumper_stop_active = False
@@ -1721,6 +2188,15 @@ class TulakObstacle(Node):
         )
 
     def on_emergency_stop(self, data):
+        # Tracked as state, not just acted on once, so the hold survives
+        # the next on_pose2d cycle. With terminate_on_stop=True (the
+        # default, and what the non-route config uses) the exception below
+        # ends the run before that can matter and nothing changes; it is
+        # terminate_on_stop=False - which the OSM config uses so the
+        # press/release cycle can act as a mode reset - that needs the
+        # software to keep itself stopped rather than trusting the state
+        # machine not to command a speed on the very next cycle.
+        self.emergency_stop_active = bool(data)
         if data:
             self.send_speed_cmd(0, 0)
         if self.raise_exception_on_stop and data:
@@ -1830,6 +2306,74 @@ class TulakObstacle(Node):
         else:
             print(self.time, 'GPS: no fix yet, own position unknown')
 
+    def _route_hold_is_absolute(self):
+        """True when the router's hold means "do not move at all", as
+        opposed to "crawl". 'stop' always does; 'creep' does too whenever
+        route_hold_creep_speed is 0, which is the default and the normal
+        setting - see the hold handling in on_pose2d for why this has to
+        pre-empt the avoidance state machine rather than cap its output."""
+        if self.route_hold == 'stop':
+            return True
+        return self.route_hold == 'creep' and self.route_hold_creep_speed <= 0
+
+    def on_route_hint(self, data):
+        """Aim point and trust level from osgar-apps/followme/osm_router.py
+        (see item 28 at top of file). Arrives at the pose2d rate.
+
+        The whole integration is this method plus four small reads of the
+        flags it sets - deliberately, because everything downstream of
+        "here is a bearing to follow" in this file is field-tuned and had
+        no reason to change. What the router replaces is only the CHOICE
+        of target: instead of the final destination, which a bearing
+        points at straight through whatever lawn lies between, the target
+        becomes a point a few meters ahead on a mapped path.
+
+        data keys: state, lat/lon (the aim point, None when there is no
+        active route), remaining_m (to the real destination, ALONG the
+        route), authority (0..1), cross_track_m, off_route, arrived, hold
+        ('creep'|'stop'|None - see on_pose2d)."""
+        self.route_mode = True
+        self.route_state = data.get('state', 'unknown')
+        self.route_authority = data.get('authority')
+        self.route_remaining_m = data.get('remaining_m')
+        self.route_cross_track_m = data.get('cross_track_m')
+        self.route_hold = data.get('hold')
+        self.route_guidance_mode = data.get('mode')
+        self.route_speed_limit = data.get('speed_limit')
+        bearing_deg = data.get('road_bearing_deg')
+        self.route_road_bearing = math.radians(bearing_deg) if bearing_deg is not None else None
+        limit_deg = data.get('steer_limit_deg')
+        self.route_steer_limit = math.radians(limit_deg) if limit_deg is not None else None
+        rate_deg = data.get('steer_rate_deg_s')
+        self.route_steer_rate = math.radians(rate_deg) if rate_deg is not None else None
+        plan_seq = data.get('plan_seq')
+        if plan_seq != self.route_plan_seq:
+            # a fresh plan - whatever bias had built up was accumulated
+            # against a route that no longer exists
+            self._route_bias = 0.0
+            self.route_plan_seq = plan_seq
+
+        lat, lon = data.get('lat'), data.get('lon')
+        if lat is None or lon is None:
+            # no route to follow right now (waiting for the start QR, mid
+            # re-plan, arrived, lost). Clear the target so _drive_steering
+            # falls back to pure road following rather than steering at a
+            # stale aim point; on_pose2d's hold handling decides whether
+            # the robot may move at all.
+            self.target_lat = self.target_lon = None
+            self.bearing_to_target = None
+            self.target_dist = None
+        else:
+            self.target_lat, self.target_lon = lat, lon
+            if self.last_fix is not None:
+                # recomputed here rather than waiting for on_nmea_data: the
+                # aim point moves with every pose2d cycle while fixes only
+                # arrive at 1Hz, and a bearing to last cycle's aim point is
+                # exactly the lag this is meant to avoid at a junction
+                self.target_dist = haversine_distance(*self.last_fix, lat, lon)
+                self.bearing_to_target = initial_bearing(*self.last_fix, lat, lon)
+        self.waypoint_reached = bool(data.get('arrived'))
+
     @staticmethod
     def _blend_angle(old_angle, new_angle, alpha):
         """Circular EMA between two angles (radians) - wrap-around-safe
@@ -1875,6 +2419,22 @@ class TulakObstacle(Node):
         if not self.have_imu_heading:
             return None
         return normalize_angle(math.pi / 2 - self.compass_sign * self.last_heading)
+
+    def _apply_compass_calibration(self, raw_compass):
+        """raw geometric compass heading -> corrected true bearing.
+
+        Two terms: the learned/configured constant (declination plus mount
+        rotation) and the hard-iron sinusoid (see compass_hardiron in
+        __init__). The sinusoid is a function of TRUE heading, which is
+        what we are solving for, so it is evaluated at the
+        constant-corrected heading - one fixed-point step, which is ample
+        when the amplitude is ~11 deg and its derivative correspondingly
+        small."""
+        heading = normalize_angle(raw_compass + self.compass_offset)
+        if self.compass_hardiron:
+            heading = normalize_angle(
+                heading + self.compass_hardiron * math.cos(heading - self.compass_hardiron_phase))
+        return heading
 
     def _gps_fix_quality_ok(self, data):
         """True if this NMEA fix (the raw dict from on_nmea_data - see
@@ -1985,13 +2545,47 @@ class TulakObstacle(Node):
                 self.compass_offset, target_offset, self.compass_offset_smoothing_alpha)
         self.compass_last_calibrated = self.time
 
+    def _update_gps_course(self, data):
+        """Take the receiver's own course over ground from the merged RMC
+        fields, when it is trustworthy - see use_gps_course in __init__.
+
+        Gated on speed twice over: the receiver leaves cog empty at a
+        standstill (course is derived from velocity, and there is none),
+        and gps_course_min_speed additionally rejects the crawl range where
+        what it does report is mostly noise. Also requires the robot to be
+        driving FORWARD - course over ground is the direction of travel, so
+        while reversing it points a half turn away from where the robot
+        faces, exactly the error that corrupted compass calibration from
+        position chords."""
+        if not self.use_gps_course:
+            return
+        cog, sog = data.get('cog'), data.get('sog')
+        if cog is None or sog is None or sog < self.gps_course_min_speed:
+            return
+        if self._last_commanded_speed <= 0.01:
+            return
+        self.gps_course = math.radians(cog) % (2 * math.pi)
+        self.gps_course_time = self.time
+
+    def _fresh_gps_course(self):
+        """gps_course if recent enough to still describe where the robot is
+        pointed, else None. Stale course is worse than none - it keeps
+        asserting the last direction of travel after a turn has begun."""
+        if self.gps_course is None or self.gps_course_time is None:
+            return None
+        if self.time - self.gps_course_time > self.gps_course_max_age:
+            return None
+        return self.gps_course
+
     def on_nmea_data(self, data):
+        self._update_gps_course(data)
         lat, lon = data.get('lat'), data.get('lon')
         if lat is not None and lon is not None:
             if data.get('lat_dir') == 'S':
                 lat = -lat
             if data.get('lon_dir') == 'W':
                 lon = -lon
+            self.last_fix = (lat, lon)
 
             had_heading = self.travel_heading is not None
             if self.last_gps_pos is not None:
@@ -2006,8 +2600,20 @@ class TulakObstacle(Node):
                     # _smooth_heading and item 9 at top of file)
                     self.travel_heading = self._smooth_heading(initial_bearing(*self.last_gps_pos, lat, lon))
                     self.last_gps_pos = (lat, lon)
+                    # Prefer the receiver's course over ground for teaching
+                    # the compass: it is an instantaneous direction of
+                    # travel matched to an instantaneous compass reading,
+                    # so it needs none of the straightness/forward gates
+                    # that exist only because a chord between two fixes
+                    # averages over whatever the robot did in between
+                    # (item 26). Those gates still apply when falling back
+                    # to travel_heading.
+                    course = self._fresh_gps_course()
                     straight = self._baseline_was_straight()
                     if (self.use_compass_heading and self.compass_learn_offset
+                            and self._gps_fix_quality_ok(data) and course is not None):
+                        self._update_compass_calibration(course)
+                    elif (self.use_compass_heading and self.compass_learn_offset
                             and self._gps_fix_quality_ok(data) and straight):
                         # right when travel_heading is at its most
                         # trustworthy (baseline-confirmed, quality-gated,
@@ -2028,7 +2634,14 @@ class TulakObstacle(Node):
             if self.target_lat is not None:
                 self.target_dist = haversine_distance(lat, lon, self.target_lat, self.target_lon)
                 self.bearing_to_target = initial_bearing(lat, lon, self.target_lat, self.target_lon)
-                if not self.waypoint_reached and self.target_dist < self.waypoint_arrival_dist_m:
+                # In route mode target_lat/lon is a rolling aim point a few
+                # meters ahead, NOT the destination - so target_dist is
+                # always about one lookahead and would trip this check on
+                # the very first fix. Arrival is the router's call there
+                # (it knows the distance REMAINING ALONG THE ROUTE, which
+                # is the honest measure); it arrives via on_route_hint.
+                if (not self.route_mode and not self.waypoint_reached
+                        and self.target_dist < self.waypoint_arrival_dist_m):
                     self.waypoint_reached = True
                     print(self.time, 'waypoint reached (%.1fm), stopping' % self.target_dist)
 
@@ -2118,12 +2731,26 @@ class TulakObstacle(Node):
         lucky frame releases it."""
         if not self.blind_hold_enabled:
             return
-        center_blank = self.last_obstacle <= 0.0
+        # NOT keyed off the centre reading any more. It used to test
+        # "centre == 0.0", the sentinel _dist returns for an untrusted
+        # window - but center_fail_dist_m makes that value configurable,
+        # and raising it for a competition run would have silently
+        # disabled blindness detection altogether, which is the one thing
+        # that must not depend on how forgiving the fail-safe is set to
+        # be. depth_profile covers the same columns and more, and the
+        # ground band below is the real "is the camera alive" test.
         if self.depth_profile:
             valid_frac = sum(1 for d in self.depth_profile if d is not None) / len(self.depth_profile)
         else:
             valid_frac = 0.0
-        blind_now = center_blank and valid_frac < self.blind_profile_valid_frac
+        # If the ground band still sees the floor, the camera is working and
+        # this is a far/open scene rather than blindness - see
+        # blind_ground_valid_frac. Unknown (never received, e.g. the
+        # ground_hazard link not wired) deliberately does NOT veto, so
+        # behaviour is unchanged where that signal is unavailable.
+        ground_alive = (self.ground_valid_frac is not None
+                        and self.ground_valid_frac >= self.blind_ground_valid_frac)
+        blind_now = valid_frac < self.blind_profile_valid_frac and not ground_alive
 
         if blind_now:
             self.blind_streak += 1
@@ -2155,9 +2782,14 @@ class TulakObstacle(Node):
         lives here, same pattern as stop_streak/turn_streak above, rather
         than in the sensing module. valid_frac/dist are only for
         diagnostics/logging, not part of the trigger decision itself."""
+        hazard, valid_frac, dist = data
+        # kept regardless of enable_ground_hazard: the drop-off REACTION is
+        # what that switch turns off, but the ground band's valid fraction
+        # is also the blind detector's "is the camera alive" signal (see
+        # blind_ground_valid_frac) and that must keep working either way
+        self.ground_valid_frac = valid_frac
         if not self.enable_ground_hazard:
             return  # ObstacleDetector3DZones still computes/publishes it - just ignored here
-        hazard, valid_frac, dist = data
         self.ground_hazard_streak = self.ground_hazard_streak + 1 if hazard else 0
 
         if self.ground_hazard_streak >= self.ground_hazard_confirm_frames:
@@ -2178,7 +2810,11 @@ class TulakObstacle(Node):
         height, width = mask.shape
         mask[:height // 2, :] = 0  # ignore sky/horizon in the top half
 
-        center_y, center_x = mask_center(mask)
+        if self.mask_row_weighting:
+            center_x = weighted_mask_center_x(mask, height // 2)
+            center_y = height * 3 // 4  # only used for the viewer crosshair
+        else:
+            center_y, center_x = mask_center(mask)
         half = width / 2
         dead = (width // 16) / half  # same dead-zone width as before, as a fraction of half-width
 
@@ -2722,6 +3358,133 @@ class TulakObstacle(Node):
               math.degrees(normalize_angle(best_h - self.last_heading)),
               ('%.2fm' % ahead) if ahead is not None else 'unknown'))
 
+    def _update_flank_memory(self, xy):
+        """Remember the closest thing seen on each flank recently - see the
+        tail-swing notes in __init__. Expires on BOTH age and travel: this
+        is a statement about the robot's immediate surroundings, and it
+        stops being true once the robot has driven past."""
+        if not self.tail_swing_enabled:
+            return
+        for side, dist in ((1, self.left_dist), (-1, self.right_dist)):
+            history = self._flank_history[side]
+            if dist is not None:
+                history.append((self.time, xy, dist))
+            while history and (self.time - history[0][0] > self.flank_memory_time
+                                or math.hypot(xy[0] - history[0][1][0],
+                                              xy[1] - history[0][1][1]) > self.flank_memory_dist_m):
+                history.popleft()
+
+    def _flank_clearance(self, side):
+        """Closest thing known on one flank (+1 left, -1 right): the smaller
+        of what the zone sees now and what was seen recently. The memory is
+        the whole point - nothing on this robot looks sideways or back, so
+        once the robot draws level with something the live zone has already
+        lost it."""
+        live = self.left_dist if side > 0 else self.right_dist
+        remembered = min((d for _t, _xy, d in self._flank_history[side]), default=None)
+        known = [d for d in (live, remembered) if d is not None]
+        return min(known) if known else None
+
+    def _lateral_clearance(self, side):
+        """Flank RANGE converted to the lateral offset that actually
+        matters for the swing - see side_zone_bearing in __init__."""
+        rng = self._flank_clearance(side)
+        return None if rng is None else rng * math.sin(self.side_zone_bearing)
+
+    def _articulated_steering_limit(self, steering_sign):
+        """Largest |steering| (radians) this chassis can be asked for
+        without sweeping something beside it, or None for no limit.
+
+        TWO separate hazards, and they are on OPPOSITE sides:
+
+        INSIDE the turn - turning TOWARD something close. The whole robot
+            curves that way, and the REAR, still level with the obstacle
+            after the front has passed it, is carried into it. This is the
+            reported incident: a pole passed on the left, the camera lost
+            it, the right zone read clear, Matty turned hard right and the
+            rear-right wheel caught the pole and started to climb it -
+            loading the single central articulation joint in exactly the
+            way it should never be loaded. Encroachment over a body length
+            L at radius R is about L^2/(2R), and R = a/tan(gamma/2) with
+            a = half the wheelbase, so it grows as tan(gamma/2).
+
+        OUTSIDE the turn - the rear overhang swinging out the other way,
+            the ordinary long-vehicle tail swing, growing as sin(gamma).
+
+        Both are measured on the logs, on hard-steer forward cycles:
+                            inside <0.8m   outside <0.8m
+            TURNING             63.4%          67.9%
+            REALIGNING          62.5%          41.8%
+        and on the inside the camera could still see it in only 33% of
+        cases (7.8% while REALIGNING). So the limit is the tighter of the
+        two - guarding only one side would leave the reported failure
+        wide open, and I had it on the wrong side until the field report
+        said which wheel actually hit.
+
+        Positive steering is LEFT, so the inside of the turn is the left
+        flank for positive steering."""
+        if not self.tail_swing_enabled:
+            return None
+        inside = 1 if steering_sign > 0 else -1
+        limits = [self._corner_swing_limit(self._lateral_clearance(inside)),
+                  self._corner_swing_limit(self._lateral_clearance(-inside))]
+        limits = [l for l in limits if l is not None]
+        return min(limits) if limits else None
+
+    def _corner_swing_limit(self, clearance_m):
+        """Steering ceiling (radians) from the rear outer corner sweeping
+        sideways, given the LATERAL clearance beside the robot.
+
+        Measured chassis (2026-09-05): the joint sits at the centre of the
+        14.5cm gap between two 17.5cm boxes, the rear bumper is 3cm past
+        the rear box, and the wheels take the total width to 35.5cm. So
+
+            joint -> rear bumper   L = 0.2775 m
+            half width             W = 0.1775 m
+            joint -> rear corner   r = hypot(L, W) = 0.329 m
+            corner off the axis    phi0 = atan(W/L) = 32.6 deg
+
+        Articulating by gamma rotates the rear body about that joint, so
+        the corner's lateral extent from the centreline is
+
+            extent(gamma) = r * sin(phi0 + gamma)
+
+        which is exactly W at gamma=0 (the corner IS the body edge there)
+        and peaks at r when phi0+gamma = 90 deg, i.e. 57 deg of
+        articulation. Beyond the body edge that is 0.152 m at the peak and
+        0.144 m at the platform's own 45 deg limit - not a rounding error,
+        which is why a pole passed cleanly by the front can still be
+        caught by the rear wheel.
+
+        Inverting: gamma <= asin((clearance - margin)/r) - phi0.
+
+        Applied to BOTH flanks (see _articulated_steering_limit). Exactly
+        which corner swings which way depends on how the articulation
+        change is shared between front and rear wheels, which depends on
+        grip and is not something this code can know; the symmetric,
+        conservative reading is the honest one and costs little, since the
+        limit only binds within about half a metre."""
+        if clearance_m is None or self.rear_corner_radius_m <= 0:
+            return None
+        room = clearance_m - self.swing_margin_m
+        if room >= self.rear_corner_radius_m:
+            return None                      # geometry cannot reach that far
+        if room <= self.rear_corner_radius_m * math.sin(self.rear_corner_angle):
+            # already inside the static body width plus margin - nothing to
+            # do but keep the floor so the robot can still manoeuvre
+            return self.swing_min_steering
+        limit = math.asin(room / self.rear_corner_radius_m) - self.rear_corner_angle
+        return max(self.swing_min_steering, limit)
+
+    def _limit_tail_swing(self, steering):
+        """Clamp a commanded steering angle to what the chassis has room for.
+        Only ever reduces the magnitude, never flips the sign or adds
+        steering - so it cannot invent a maneuver, only soften one."""
+        limit = self._articulated_steering_limit(steering)
+        if limit is None or abs(steering) <= limit:
+            return steering
+        return math.copysign(limit, steering)
+
     def _adaptive_speed(self, dt=None):
         """Cruising speed scaled by currently sensed clearance, within
         [min_speed, max_speed] (item 10 at top of file). max_speed
@@ -2836,7 +3599,18 @@ class TulakObstacle(Node):
         would misleadingly suggest the limiting already happened)."""
         if self.max_steering_rate is None or dt is None:
             return target
-        max_delta = self.max_steering_rate * dt.total_seconds()
+        rate = self.max_steering_rate
+        if self.route_mode and self.route_steer_rate:
+            # A junction turn has to be wound on inside the junction. At
+            # the cruising 30deg/s default, reaching 40deg takes 1.3s -
+            # 0.65m at cruising speed, most of the way across the fork -
+            # so the router raises this while approaching one. Only ever
+            # taken as a RELAXATION (max), never a tightening: the
+            # smoothness this limit exists to protect is a property of
+            # ordinary cruising, and the router has no business making
+            # cruising twitchier than it is configured to be.
+            rate = max(rate, self.route_steer_rate)
+        max_delta = rate * dt.total_seconds()
         delta = max(-max_delta, min(max_delta, target - self._last_commanded_steering))
         return self._last_commanded_steering + delta
 
@@ -2866,7 +3640,15 @@ class TulakObstacle(Node):
         if self.use_compass_heading and self.compass_offset is not None:
             raw_compass = self._compass_heading()
             if raw_compass is not None:
-                return normalize_angle(raw_compass + self.compass_offset), 'compass'
+                return self._apply_compass_calibration(raw_compass), 'compass'
+        # receiver's own course over ground - preferred over fix
+        # differencing, which it beats on steadiness by roughly 3x and
+        # needs no baseline, no straight-line assumption and no reverse
+        # gate (item 26). Only available while actually moving, hence the
+        # travel_heading fallback below rather than a replacement.
+        course = self._fresh_gps_course()
+        if course is not None:
+            return course, 'gps-course'
         if self.travel_heading is not None:
             return self.travel_heading, 'gps-diff'
         return None, 'none'
@@ -2882,7 +3664,8 @@ class TulakObstacle(Node):
         fallback for before any compass calibration exists. Returns None
         if neither is available."""
         if self.use_compass_heading and self.compass_offset is not None:
-            return normalize_angle(math.pi / 2 - self.compass_sign * imu_heading + self.compass_offset)
+            return self._apply_compass_calibration(
+                normalize_angle(math.pi / 2 - self.compass_sign * imu_heading))
         if self.heading_frame_offset is not None:
             return normalize_angle(imu_heading + self.heading_frame_offset)
         return None
@@ -2925,10 +3708,74 @@ class TulakObstacle(Node):
         bearing term; this doesn't replace that check. Not field-tested -
         15.0 (the bearing_near_target_dist_m default) is a starting point,
         same caveat as the rest of this file's GPS code."""
-        if self.target_dist is None or self.bearing_near_target_dist_m <= self.waypoint_arrival_dist_m:
+        # In route mode target_dist is the distance to a rolling aim point
+        # a lookahead ahead (~8m), not to the destination - feeding that in
+        # here would fade the bearing out permanently, for the whole run,
+        # on a route that is nowhere near finished. The honest measure of
+        # "how close am I to the end" is the router's remaining distance
+        # ALONG the route, which is what this uses instead.
+        dist = self.route_remaining_m if self.route_mode else self.target_dist
+        if dist is None or self.bearing_near_target_dist_m <= self.waypoint_arrival_dist_m:
             return 1.0
         span = self.bearing_near_target_dist_m - self.waypoint_arrival_dist_m
-        return max(0.0, min(1.0, (self.target_dist - self.waypoint_arrival_dist_m) / span))
+        return max(0.0, min(1.0, (dist - self.waypoint_arrival_dist_m) / span))
+
+    def _route_heading_error(self):
+        """How far the robot is pointing off the mapped road axis, in
+        radians, positive when the robot faces clockwise (right) of the
+        road. None when either side of the comparison is unknown."""
+        if not self.route_mode or self.route_road_bearing is None:
+            return None
+        current_heading, _source = self._current_heading()
+        if current_heading is None:
+            return None
+        return normalize_angle(current_heading - self.route_road_bearing)
+
+    def _mask_trust(self):
+        """0..1 weight on the road mask, from how far the camera is
+        pointing off the mapped road axis - see mask_trust_full_deg in
+        __init__ for the measurements behind it. 1.0 (unchanged) outside
+        route mode or with no road axis known, so this cannot affect the
+        legacy path."""
+        error = self._route_heading_error()
+        if error is None:
+            return 1.0
+        error_deg = abs(math.degrees(error))
+        if error_deg <= self.mask_trust_full_deg:
+            return 1.0
+        span = self.mask_trust_none_deg - self.mask_trust_full_deg
+        if span <= 0:
+            return self.mask_trust_min
+        fade = min(1.0, (error_deg - self.mask_trust_full_deg) / span)
+        return 1.0 - fade * (1.0 - self.mask_trust_min)
+
+    def _route_corridor_bias(self, dt=None):
+        """Slow additive steering bias pulling back onto the planned
+        corridor - the LOW-FREQUENCY half of the control split described
+        at route_cross_track_gain in __init__. Positive = steer left.
+
+        Sign convention, checked end to end: the router reports
+        cross_track_m > 0 when the robot is to the RIGHT of the route's
+        direction of travel, and this platform steers left for positive
+        angles (matty.py integrates heading += dist/radius with radius
+        positive for a positive joint angle), so a positive gain on a
+        positive cross-track correctly steers left, back toward the route.
+        The heading term follows the same convention.
+
+        Smoothed with an EMA on top of the router's own per-fix smoothing:
+        this term exists to move the equilibrium, not to react, and GPS
+        noise must not reach the steering as jitter."""
+        if not self.route_mode or self.route_cross_track_m is None:
+            return 0.0
+        target = self.route_cross_track_gain * self.route_cross_track_m
+        error = self._route_heading_error()
+        if error is not None:
+            target += self.route_heading_gain * error
+        target = max(-self.route_bias_max, min(self.route_bias_max, target))
+        if dt is None:
+            return target  # diagnostic call (see _gps_status_line) - no state change
+        self._route_bias += self.route_bias_alpha * (target - self._route_bias)
+        return self._route_bias
 
     def _drive_steering(self, dt=None):
         """Steering to use when NOT actively avoiding an obstacle - i.e.
@@ -2985,7 +3832,11 @@ class TulakObstacle(Node):
         3. The final result is rate-limited (_rate_limit_steering) so
            ordinary driving doesn't snap between corrections - this step
            only, never the avoidance maneuvers themselves."""
-        local_dir = self.last_dir
+        # The mask says less when the camera is pointing well off the
+        # mapped road axis, because that is measurably when it starts
+        # reporting a lawn as drivable - see _mask_trust. Outside route
+        # mode this is exactly 1.0 and the line is a no-op.
+        local_dir = self.last_dir * self._mask_trust()
         # scale the depth component's blend weight by how much of
         # depth_profile is actually valid right now - see
         # _depth_confidence. 1.0 (no reduction) in the ordinary case;
@@ -3008,13 +3859,70 @@ class TulakObstacle(Node):
 
         current_heading, _source = self._current_heading()
         if not self.follow_gps_target or self.bearing_to_target is None or current_heading is None:
-            return self._rate_limit_steering(local_dir, dt)  # no usable heading yet
+            # No usable heading for the aim point - but in route mode the
+            # cross-track bias only needs a POSITION, which is a separate
+            # (and much better conditioned) question than a bearing, so it
+            # still applies. This is the case where GPS has a fix but no
+            # heading source has settled yet.
+            return self._rate_limit_steering(local_dir + self._route_corridor_bias(dt), dt)
 
         error = normalize_angle(current_heading - self.bearing_to_target)
-        bearing_steering = max(-self.turn_angle, min(self.turn_angle, error))
 
-        road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
-        if self.bearing_blend_road_frac > 0:
+        if self.route_mode and self.route_guidance_mode == 'corridor':
+            # --- corridor mode: the route is a BIAS, not a competitor ---
+            # Blending here would let the mask cancel the only restoring
+            # signal there is (see route_cross_track_gain in __init__ for
+            # the measurement). Adding cannot be cancelled - it moves the
+            # equilibrium the mask settles into, while leaving the mask in
+            # full charge of the fast corrections it is genuinely good at.
+            steering = local_dir + self._route_corridor_bias(dt)
+            limit = self.route_steer_limit or self.turn_angle
+            return self._rate_limit_steering(max(-limit, min(limit, steering)), dt)
+
+        # --- junction / recovery: the route takes over ---
+        # A fork needs a decisive turn, not a nudge: at the cruising 20deg
+        # ceiling Matty's turning radius is 0.91m and a 90deg turn swings
+        # wide across the corner; the router raises the ceiling toward
+        # 40deg (radius 0.44m) approaching a planned junction, and relaxes
+        # the rate limit so it can actually be reached inside the junction.
+        steer_limit = self.route_steer_limit if self.route_mode and self.route_steer_limit \
+            else self.turn_angle
+        bearing_steering = max(-steer_limit, min(steer_limit, error))
+
+        if self.route_mode and self.route_authority is not None:
+            # The router decides how much the bearing is worth right now -
+            # low on a straight path (the mask centres better than a 1-3m
+            # GPS fix), high at a junction (the mask has no opinion about
+            # which branch leads to the target) and while recovering from
+            # a confirmed excursion. See osm_router.py's "division of
+            # labour" section.
+            #
+            # This REPLACES the road-fraction gate rather than combining
+            # with it, and that is the deliberate part. That gate exists
+            # to stop the robot chasing a bearing off the road - a real
+            # risk when the bearing points at a destination 200m away
+            # across a lawn. In route mode the bearing points a few meters
+            # ahead along a mapped path, so the thing the gate protects
+            # against is already gone - while its side effect, refusing to
+            # turn toward a branch that is momentarily at the edge of the
+            # mask, would break exactly the junction case this is for.
+            weight = self.route_authority
+            # ...with one veto kept. If the mask sees essentially NO
+            # drivable surface the way the route wants to turn, do not
+            # commit a hard junction turn into it: that is what a bad fix,
+            # a mis-mapped branch or the wrong junction entirely looks
+            # like. A threshold this low (route_min_road_frac, 0.02
+            # against a typical 0.20-0.31 healthy fraction) only fires on
+            # "there is nothing there at all", not on "the branch is at
+            # the edge of the frame", which is why it can coexist with
+            # dropping the proportional gate above.
+            # positive steering is LEFT, same convention as the legacy
+            # branch below - keep the two reading identically
+            road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
+            if road_frac_that_way < self.route_min_road_frac:
+                weight = min(weight, self.route_veto_authority)
+        elif self.bearing_blend_road_frac > 0:
+            road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
             weight = min(1.0, road_frac_that_way / self.bearing_blend_road_frac)
         else:
             weight = 1.0
@@ -3025,6 +3933,29 @@ class TulakObstacle(Node):
         """Human-readable reason why GPS bearing-following is or isn't
         currently steering the robot - logging only, mirrors the guard
         clauses in _drive_steering()."""
+        if self.route_mode:
+            # in route mode the target is the router's rolling aim point,
+            # so "no target" here means the router has nothing to follow -
+            # which is normal before the start QR - and its own state is
+            # the informative thing to report, not this file's
+            parts = ['osm-route:%s' % self.route_state]
+            if self.route_guidance_mode:
+                parts.append(self.route_guidance_mode)
+            if self.route_authority is not None:
+                parts.append('authority=%.2f' % self.route_authority)
+            herr = self._route_heading_error()
+            if herr is not None:
+                parts.append('road_axis_err=%+.0fdeg mask_trust=%.2f'
+                              % (math.degrees(herr), self._mask_trust()))
+            if self.route_guidance_mode == 'corridor':
+                parts.append('bias=%+.1fdeg' % math.degrees(self._route_corridor_bias()))
+            if self.route_remaining_m is not None:
+                parts.append('remaining=%.0fm' % self.route_remaining_m)
+            if self.route_cross_track_m is not None:
+                parts.append('cross=%+.1fm' % self.route_cross_track_m)
+            if self.route_hold:
+                parts.append('HOLD=%s' % self.route_hold)
+            return ' '.join(parts)
         if self.target_lat is None:
             return 'no target'
         if not self.follow_gps_target:
@@ -3307,11 +4238,46 @@ class TulakObstacle(Node):
         # this method or any other reads it.
         self._update_polar_memory(xy)
         self._log_polar_memory(xy)
+        self._update_flank_memory(xy)
         # accumulate heading wander for the current GPS baseline - decides
         # whether that leg may teach the compass (item 23). Bookkeeping
         # only, and deliberately before the early returns below so a leg
         # spanning a stop is still judged on its full history.
-        self._track_baseline_heading()
+        if self.emergency_stop_active:
+            # Ahead of every other hold, including the blind hold: this one
+            # is a human with a finger on a button, and nothing sensed can
+            # outrank it. Only reachable with terminate_on_stop=False -
+            # otherwise on_emergency_stop has already ended the run.
+            self.send_speed_cmd(0, 0)
+            self._last_commanded_speed = 0.0
+            return
+
+        if self._route_hold_is_absolute():
+            # WAITING (no QR shown yet), ARRIVED, LOST or FAILED, with no
+            # creep speed configured: the robot must sit still, FULL STOP,
+            # and in particular must not reverse.
+            #
+            # It used to. The hold was applied as min(speed, 0) on the
+            # finished command, which does nothing to a NEGATIVE speed -
+            # so the avoidance state machine still ran underneath, and
+            # anything close enough in front (a QR code held up to the
+            # camera, for instance) sent it backing away while it was
+            # supposed to be parked. Field-reported 2026-09-04.
+            #
+            # Returning here instead of capping is what actually stops it:
+            # the state machine never runs, so nothing can command a
+            # maneuver. The depth pipeline is untouched and every sensing
+            # handler keeps running and logging - on_obstacle_zones still
+            # updates the streaks, obstdet3d_zones still publishes - so
+            # this suppresses the REACTION, not the sensing, and the
+            # moment the hold lifts the streaks are already current.
+            if self.state != State.DRIVE:
+                # do not resume a half-finished maneuver when it lifts
+                self._enter_drive()
+            self.send_speed_cmd(0, 0)
+            self._last_commanded_speed = 0.0
+            self._last_commanded_steering = 0.0
+            return
 
         if not self.have_obstacle_data:
             # camera pipeline still booting (OAK-D Pro typically takes a
@@ -3433,7 +4399,8 @@ class TulakObstacle(Node):
             # avoid_steering/scan_min_sweep still apply unchanged for a
             # close/severe encounter or in escape mode; a shallow/diagonal
             # graze gets a smaller, quicker correction instead.
-            speed, steering_angle = self.avoid_speed, self.turn_sign * self.current_avoid_steering
+            speed = self.avoid_speed
+            steering_angle = self._limit_tail_swing(self.turn_sign * self.current_avoid_steering)
             elapsed = self.time - self.state_start_time
             self.scan_samples.append((self.last_heading, self.last_obstacle, self.left_dist, self.right_dist))
             swept = abs(normalize_angle(self.last_heading - self.scan_start_heading))
@@ -3520,8 +4487,9 @@ class TulakObstacle(Node):
                 self._enter_drive()
                 speed, steering_angle = self._adaptive_speed(dt), self._drive_steering(dt)
             else:
-                steering_angle = max(-self.realign_max_steering,
-                                     min(self.realign_max_steering, error * self.realign_gain))
+                steering_angle = self._limit_tail_swing(
+                    max(-self.realign_max_steering,
+                        min(self.realign_max_steering, error * self.realign_gain)))
                 speed = self._adaptive_speed(dt)
 
         elif is_emergency or (not self.avoid_obstacles and self.stop_streak >= self.stop_confirm_frames):
@@ -3542,13 +4510,43 @@ class TulakObstacle(Node):
             else:
                 print(self.time, 'obstacle nearby, start turning', self.last_obstacle)
                 self._enter_turning()
-                speed, steering_angle = self.avoid_speed, self.turn_sign * self.current_avoid_steering
+                speed = self.avoid_speed
+                steering_angle = self._limit_tail_swing(self.turn_sign * self.current_avoid_steering)
 
         elif self.waypoint_reached:
             speed, steering_angle = 0, 0
 
         else:
             speed, steering_angle = self._adaptive_speed(dt), self._drive_steering(dt)
+
+        # Route hold (item 28). Applied HERE, as a cap on the finished
+        # command rather than as an early return near the top, on purpose:
+        # every hold this file already has (blind, ground_hazard, bumper)
+        # is a safety stop that must pre-empt the state machine, whereas
+        # this one is a navigation decision - "there is nowhere to go yet"
+        # or "we are there" - and obstacle avoidance must keep full
+        # authority underneath it. Capping only the FORWARD speed leaves
+        # an avoidance backup free to run while the robot waits.
+        #
+        #   'creep' - no route yet: before the start QR is read, or during
+        #             a re-plan. route_hold_creep_speed decides whether
+        #             that means standing still (0.0, the default) or
+        #             inching forward.
+        #   'stop'  - arrived, lost, or no route exists. A real stop.
+        if self.route_hold == 'creep':
+            # only the crawling form reaches here - an absolute hold has
+            # already returned above, before the state machine ran
+            speed = min(speed, self.route_hold_creep_speed)
+        elif self.route_speed_limit is not None:
+            # Slowing into a planned fork, or while recovering back onto
+            # the corridor. Both are situations where the steering has to
+            # do something large and the cost of getting it wrong is
+            # leaving the path, and both get easier at half the speed: the
+            # turn fits in less ground, and every adaptive stopping
+            # distance downstream shrinks with it. Never speeds anything
+            # up - it is a cap, applied after the state machine, so an
+            # avoidance maneuver already going slower stays slower.
+            speed = min(speed, self.route_speed_limit)
 
         # record forward-driving steering history for a future retrace
         # backup (see _enter_backing_up/_next_retrace_steering) - only

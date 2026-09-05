@@ -4,10 +4,12 @@
   ground detection windows overlaid, the color image, and a HUD showing
   what command was sent to the platform and why.
 
-  This does NOT reimplement tulak_obstacle.py / obstdet3d_zones.py logic -
-  it replays the ACTUAL TulakObstacle and ObstacleDetector3DZones classes
-  against the inputs recorded in the log (obstacle_zones, ground_hazard,
-  rotation, pose2d, nn_mask, qr_code, nmea_data, ...), using the log's own
+  This does NOT reimplement tulak_obstacle.py / obstdet3d_zones.py /
+  osm_router.py logic - it replays the ACTUAL TulakObstacle,
+  ObstacleDetector3DZones and (for runs recorded with an OSM route config)
+  OSMRouter classes against the inputs recorded in the log
+  (obstacle_zones, ground_hazard, rotation, pose2d, nn_mask, route_hint,
+  nmea_data, ...), using the log's own
   recorded links (config['robot']['links']) to know which stream feeds
   which handler - so it automatically stays correct if the config is
   rewired later. Because both classes derive all of their timing purely
@@ -19,6 +21,14 @@
   the depth RoI shift line, etc.) which is captured here and shown as a
   "recent events" feed - that print output is the only thing this log
   does NOT already carry as a bus stream.
+
+  Runs recorded with config/matty-tulak-osm.json get an extra HUD line
+  with the route state: progress and distance remaining along the plan,
+  cross-track from the planned corridor, distance to the next planned
+  junction, and the bearing authority currently handed to the route (see
+  osm_router.py). That authority line is the one to watch if the robot
+  takes a wrong branch at a fork. Older logs have no osm_router module and
+  the line is simply absent - nothing else changes.
 
   Controls (same as robotem-rovne/view_mask.py):
     space - pause / step one frame
@@ -288,7 +298,7 @@ def fmt_dist(x):
 N_REASON_LINES = 5
 
 
-def build_hud_lines(dt, app, zones, reason_log):
+def build_hud_lines(dt, app, zones, reason_log, osm=None):
     """Always returns the same number of lines, so the HUD panel (and the
     overall composite frame, for --create-video) has a constant size."""
     lines = []
@@ -348,6 +358,40 @@ def build_hud_lines(dt, app, zones, reason_log):
     else:
         lines.append("")
 
+    if app.route_mode:
+        # Only the numbers that decide something. progress/remaining say
+        # where along the plan the robot thinks it is; cross-track is what
+        # the corridor monitor watches; authority is how much of the
+        # steering the route is currently allowed to set (see
+        # osm_router.py's "division of labour"), and is the line to watch
+        # if the robot takes a wrong branch at a fork.
+        parts = ['route: %s' % app.route_state]
+        if app.route_remaining_m is not None:
+            parts.append('remaining=%.0fm' % app.route_remaining_m)
+        if app.route_cross_track_m is not None:
+            parts.append('cross=%+.1fm' % app.route_cross_track_m)
+        if app.route_guidance_mode:
+            parts.append(app.route_guidance_mode.upper())
+        if app.route_authority is not None:
+            parts.append('authority=%.2f' % app.route_authority)
+        herr = app._route_heading_error()
+        if herr is not None:
+            # the two numbers behind item 29: how far the camera is off the
+            # mapped road axis, and how much the mask is worth as a result
+            parts.append('road_axis_err=%+.0fdeg' % math.degrees(herr))
+            parts.append('mask_trust=%.2f' % app._mask_trust())
+        if app.route_guidance_mode == 'corridor':
+            parts.append('bias=%+.1fdeg' % math.degrees(app._route_bias))
+        if app.route_steer_limit:
+            parts.append('steer_lim=%.0fdeg' % math.degrees(app.route_steer_limit))
+        if app.route_hold:
+            parts.append('HOLD=%s' % app.route_hold)
+        if osm is not None and osm.route is not None:
+            parts.append('next_junction=%.0fm' % osm.route.next_junction_dist(osm.s))
+        lines.append('   '.join(parts))
+    else:
+        lines.append("")
+
     lines.append("-- recent events --")
     recent = list(reason_log)[-N_REASON_LINES:]
     for _ in range(N_REASON_LINES - len(recent)):
@@ -360,7 +404,7 @@ def build_hud_lines(dt, app, zones, reason_log):
 
 
 def render_frame(dt, depth_mm, color_img, mask, app, zones, reason_log, max_depth_mm, depth_scale, color_size,
-                  right_panel='color'):
+                  right_panel='color', osm=None):
     h, w = depth_mm.shape
     depth_panel = cv2.resize(colorize_depth(depth_mm, max_depth_mm), (w * depth_scale, h * depth_scale),
                               interpolation=cv2.INTER_NEAREST)
@@ -390,7 +434,7 @@ def render_frame(dt, depth_mm, color_img, mask, app, zones, reason_log, max_dept
     else:
         top = depth_panel
 
-    lines = build_hud_lines(dt, app, zones, reason_log)
+    lines = build_hud_lines(dt, app, zones, reason_log, osm)
     hud = np.zeros((20 + 18 * len(lines) + 10, top.shape[1], 3), dtype=np.uint8)
     y = 20
     for line in lines:
@@ -420,6 +464,18 @@ def read_logfile(logfile, max_depth_mm=4000, show_color=True, depth_scale=2, sta
     app.verbose = verbose
     zones.verbose = verbose
     nodes = {'app': app, 'obstdet3d_zones': zones}
+
+    # OSM route planning (osm_router.py) - replayed the same way as the
+    # other two nodes when the run was recorded with a config that had it
+    # (matty-tulak-osm.json). Old logs simply have no 'osm_router' module
+    # and everything below stays None, so this file keeps working on every
+    # run recorded before the mode existed.
+    osm = None
+    if 'osm_router' in modules:
+        from osm_router import OSMRouter
+        osm = OSMRouter(modules['osm_router']['init'], FakeBus())
+        osm.verbose = verbose
+        nodes['osm_router'] = osm
     router = build_router(full_cfg['links'], set(nodes.keys()))
 
     stream_names = lookup_stream_names(logfile)
@@ -464,7 +520,7 @@ def read_logfile(logfile, max_depth_mm=4000, show_color=True, depth_scale=2, sta
 
                 frame = render_frame(dt, data, color_img, last_mask, app, zones, reason_log,
                                       max_depth_mm, depth_scale, color_size if show_color else None,
-                                      right_panel=right_panel)
+                                      right_panel=right_panel, osm=osm)
                 cv2.imshow('Matty obstacle viewer', frame)
                 if writer is not None:
                     writer.write(frame)

@@ -1,0 +1,472 @@
+{
+  "version": 2,
+  "robot": {
+    "env": {
+      "OSGAR_LOGS_PREFIX": null
+    },
+    "modules": {
+      "app": {
+        "driver": "tulak_obstacle:TulakObstacle",
+        "in": [
+          "emergency_stop",
+          "pose2d",
+          "rotation",
+          "bumpers_front",
+          "bumpers_rear",
+          "obstacle_zones",
+          "ground_hazard",
+          "nn_mask",
+          "route_hint",
+          "nmea_data",
+          "depth_profile"
+        ],
+        "out": [
+          "desired_steering"
+        ],
+        "init": {
+          "max_speed": 0.5,
+          "stop_dist": 0.6,
+          "turning_dist": 0.8,
+          "close_confirm_frames": 5,
+          "stop_confirm_frames": 3,
+          "side_stop_dist_factor": 0.9,
+          "side_turning_dist_factor": 0.6,
+          "side_trigger_center_clear_factor": 1.5,
+          "min_turn_time_sec": 0.1,
+          "max_turn_time_sec": 8.0,
+          "avoid_obstacles": true,
+          "backup_speed": 0.2,
+          "min_backup_time_sec": 1.0,
+          "max_backup_time_sec": 8.0,
+          "max_realign_time_sec": 3.0,
+          "terminate_on_stop": true,
+          "enable_ground_hazard": false,
+          "ground_hazard_confirm_frames": 3,
+          "terminate_on_ground_hazard": false,
+          "follow_gps_target": true,
+          "gps_heading_min_baseline_m": 5.0,
+          "use_gps_course": true,
+          "gps_course_min_speed": 0.2,
+          "gps_course_max_age_sec": 3.0,
+          "gps_heading_smoothing_alpha": 0.4,
+          "use_compass_heading": true,
+          "compass_sign": 1,
+          "compass_offset_smoothing_alpha": 0.1,
+          "compass_calibration_min_quality": 1,
+          "compass_calibration_max_hdop": 3.0,
+          "compass_calibration_max_heading_spread_deg": 12.0,
+          "compass_learn_offset": false,
+          "compass_offset_deg": 7.0,
+          "waypoint_arrival_dist_m": 3.0,
+          "bearing_blend_road_frac": 0.3,
+          "bearing_near_target_dist_m": 15.0,
+          "gps_log_interval_sec": 2.0,
+          "retrace_buffer_sec": 12.0,
+          "scan_min_sweep_deg": 30,
+          "scan_confident_margin": 1.5,
+          "side_zone_weight": 0.5,
+          "bearing_penalty_weight": 0.8,
+          "adaptive_distances": true,
+          "decel_mps2": 1.0,
+          "reaction_margin_sec": 0.2,
+          "depth_fps": 10,
+          "stop_dist_margin_m": 0.15,
+          "turning_lead_sec": 0.4,
+          "stop_dist_min": 0.5,
+          "stop_dist_max": 2.0,
+          "turning_dist_min": 0.9,
+          "turning_dist_max": 3.0,
+          "adaptive_speed": true,
+          "min_speed": 0.15,
+          "speed_clearance_ceiling": 2.0,
+          "speed_side_clearance_factor": 0.6,
+          "max_speed_accel_mps2": 0.3,
+          "free_space_weight": 0.5,
+          "free_space_lead_margin": 1.8,
+          "edge_bins_watched": 1,
+          "edge_correction_min_deg": 8,
+          "edge_correction_max_deg": 35,
+          "edge_correction_center_in_gap": true,
+          "avoidance_bin_scale_floor": 0.5,
+          "max_steering_rate_deg_s": 30,
+          "min_avoid_steering_deg": 20,
+          "min_scan_sweep_deg": 10,
+          "turn_sign_switch_margin_m": 0.2,
+          "bin_override_margin": 0.3,
+          "max_same_direction_repeats": 1,
+          "max_maneuver_aborts": 3,
+          "deep_stuck_cycle_span": 2,
+          "failed_heading_penalty_weight": 1.0,
+          "failed_heading_tolerance_deg": 30,
+          "failed_headings_maxlen": 8,
+          "deep_stuck_candidate_pool": 4,
+          "escape_backup_time_boost": 1.0,
+          "max_bumper_hits": 3,
+          "polar_memory_bins": 24,
+          "polar_memory_max_age_sec": 20.0,
+          "polar_memory_max_travel_m": 1.5,
+          "polar_profile_hfov_deg": 66,
+          "polar_memory_log_interval_sec": 5.0,
+          "polar_memory_far_fill_m": 13.5,
+          "blind_hold_enabled": true,
+          "blind_profile_valid_frac": 0.25,
+          "blind_ground_valid_frac": 0.1,
+          "blind_confirm_frames": 3,
+          "blind_clear_frames": 3,
+          "blind_creep_speed": 0.15,
+          "blind_creep_max_dist_m": 0.5,
+          "route_hold_creep_speed": 0.0,
+          "route_cross_track_gain_deg_per_m": 3.0,
+          "route_heading_gain": 0.35,
+          "route_bias_max_deg": 15.0,
+          "route_bias_alpha": 0.15,
+          "mask_trust_full_deg": 25.0,
+          "mask_trust_none_deg": 60.0,
+          "mask_trust_min": 0.25,
+          "route_min_road_frac": 0.02,
+          "route_veto_authority": 0.3,
+          "compass_hardiron_deg": 10.3,
+          "compass_hardiron_phase_deg": 9.0,
+          "tail_swing_enabled": true,
+          "flank_memory_sec": 6.0,
+          "flank_memory_dist_m": 2.0,
+          "mask_row_weighting": true,
+          "rear_corner_radius_m": 0.329,
+          "rear_corner_angle_deg": 32.6,
+          "swing_margin_m": 0.1,
+          "swing_min_steering_deg": 10,
+          "side_zone_bearing_deg": 20.0
+        }
+      },
+      "osm_router": {
+        "driver": "osm_router:OSMRouter",
+        "in": [
+          "nmea_data",
+          "qr_code",
+          "pose2d",
+          "rotation",
+          "emergency_stop"
+        ],
+        "out": [
+          "route_hint",
+          "route_plan"
+        ],
+        "init": {
+          "map_file": [
+            "maps/suchdol.json",
+            "maps/stromovka.json"
+          ],
+          "lookahead_m": 8.0,
+          "lookahead_min_m": 3.0,
+          "recovery_lookahead_m": 4.0,
+          "junction_overshoot_m": 3.0,
+          "junction_zone_m": 12.0,
+          "junction_exit_m": 6.0,
+          "cruise_authority": 0.45,
+          "junction_authority": 0.85,
+          "recovery_authority": 0.9,
+          "corridor_soft_m": 4.0,
+          "corridor_hard_m": 8.0,
+          "corridor_hard_confirm_sec": 6.0,
+          "lost_dist_m": 25.0,
+          "lost_confirm_sec": 10.0,
+          "cross_track_alpha": 0.4,
+          "gps_snap_alpha": 0.4,
+          "gps_search_back_m": 12.0,
+          "gps_search_fwd_m": 18.0,
+          "arrival_dist_m": 3.0,
+          "uturn_penalty_m": 40.0,
+          "max_replans": 6,
+          "replan_cooldown_sec": 15.0,
+          "recovery_replan_after_sec": 30.0,
+          "stall_sec": 60.0,
+          "stall_dist_m": 2.0,
+          "target_snap_warn_m": 15.0,
+          "compass_sign": 1,
+          "compass_offset_deg": 7.0,
+          "log_interval_sec": 3.0,
+          "cruise_steer_limit_deg": 20.0,
+          "junction_steer_limit_deg": 40.0,
+          "recovery_steer_limit_deg": 30.0,
+          "cruise_steer_rate_deg_s": 30.0,
+          "junction_steer_rate_deg_s": 90.0,
+          "junction_speed_limit": 0.3,
+          "recovery_speed_limit": 0.3,
+          "enable_gps_routing": true,
+          "wait_for_start_qr": true,
+          "max_snap_dist_m": 50.0,
+          "compass_hardiron_deg": 10.3,
+          "compass_hardiron_phase_deg": 9.0,
+          "corner_angle_deg": 35.0,
+          "corridor_max_aim_offset_deg": 50.0,
+          "junction_max_aim_offset_deg": 110.0,
+          "gps_dead_reckon_sec": 15.0,
+          "gps_lost_sec": 45.0,
+          "gps_degraded_speed_limit": 0.3
+        }
+      },
+      "platform": {
+        "driver": "osgar.platforms.matty:Matty",
+        "in": [
+          "esp_data"
+        ],
+        "out": [
+          "esp_data"
+        ],
+        "init": {}
+      },
+      "gps": {
+        "driver": "gps",
+        "in": [
+          "raw"
+        ],
+        "out": [
+          "nmea_data"
+        ],
+        "init": {}
+      },
+      "timer": {
+        "driver": "timer",
+        "in": [],
+        "out": [
+          "tick"
+        ],
+        "init": {
+          "sleep": 0.1
+        }
+      },
+      "serial": {
+        "driver": "serial",
+        "in": [
+          "raw"
+        ],
+        "out": [
+          "raw"
+        ],
+        "init": {
+          "port": "/dev/esp32",
+          "speed": 115200
+        }
+      },
+      "oak": {
+        "driver": "osgar.drivers.oak_camera:OakCamera",
+        "init": {
+          "fps": 10,
+          "is_color": true,
+          "video_encoder": "h265",
+          "h264_bitrate": 2000,
+          "is_depth": true,
+          "is_stereo_images": false,
+          "laser_projector_current": 1000,
+          "flood_light_current": 0,
+          "is_imu_enabled": true,
+          "number_imu_records": 10,
+          "disable_magnetometer_fusion": true,
+          "is_qr_detection": true,
+          "qr_resolution": "THE_800_P",
+          "mono_resolution": "THE_400_P",
+          "color_resolution": "THE_1080_P",
+          "color_manual_focus": 130,
+          "sipp_buffer_size": 0,
+          "stereo_median_filter": "KERNEL_5x5",
+          "depth_profile": "ROBOTICS",
+          "stereo_confidence_threshold": 30,
+          "stereo_speckle_filter": false,
+          "stereo_speckle_range": 50,
+          "stereo_spatial_filter": false,
+          "stereo_spatial_filter_alpha": 0.5,
+          "stereo_spatial_filter_delta": 20,
+          "stereo_spatial_filter_hole_filling_radius": 2,
+          "stereo_spatial_filter_num_iterations": 1,
+          "stereo_brightness_filter": true,
+          "stereo_brightness_filter_min": 0,
+          "stereo_brightness_filter_max": 250,
+          "stereo_threshold_filter_min_mm": 200,
+          "stereo_threshold_filter_max_mm": 15000,
+          "stereo_extended_disparity": false,
+          "stereo_subpixel": true,
+          "stereo_left_right_check": true,
+          "depth_far_mask_max_row": 300,
+          "depth_far_mask_col_margin": 80,
+          "depth_far_mask_value_mm": 15000,
+          "depth_far_mask_max_invalid_frac": 0.85,
+          "sleep_on_start_sec": 1,
+          "model": {
+            "blob": "../robotem-rovne/models/robotourist-093-redroad-20260409-224x224-rgb-chw-1shave.blob"
+          },
+          "nn_config": {
+            "output_format": "LayerFp16",
+            "NN_family": "robotourist",
+            "input_size": "224x224"
+          }
+        }
+      },
+      "obstdet3d_zones": {
+        "driver": "osgar.obstdet3d_zones:ObstacleDetector3DZones",
+        "in": [
+          "depth",
+          "orientation_list"
+        ],
+        "out": [
+          "obstacle_zones",
+          "ground_hazard",
+          "depth_profile"
+        ],
+        "init": {
+          "vertical_fov_deg": 55,
+          "max_pitch_shift_deg": 20,
+          "pitch_shift_sign": -1,
+          "pitch_offset_deg": 80.6,
+          "max_pitch_error_deg": 15,
+          "max_plausible_roll_deg": 30,
+          "pitch_smoothing_alpha": 0.15,
+          "min_shift_change_px": 12,
+          "camera_tilt_deg": 7.5,
+          "min_valid_frac": 0.15,
+          "min_real_frac": 0.02,
+          "min_real_frac_zones": 0.0,
+          "center_fail_dist_m": 0.0,
+          "center_fail_dist_open_m": 1.2,
+          "center_fail_open_recent_dist_m": 2.0,
+          "center_fail_recent_window_sec": 5.0,
+          "far_fill_value_mm": 15000,
+          "far_fill_suspect_m": 13.5,
+          "far_fill_contradiction_m": 2.0,
+          "speckle_erode_px": 3,
+          "spatial_fill_px": 5,
+          "spatial_fill_max_dist_mm": 2000,
+          "rows": [
+            175,
+            260
+          ],
+          "free_space_rows": [
+            160,
+            260
+          ],
+          "center_cols": [
+            260,
+            380
+          ],
+          "left_cols": [
+            60,
+            220
+          ],
+          "right_cols": [
+            420,
+            580
+          ],
+          "ground_rows": [
+            350,
+            395
+          ],
+          "ground_cols": [
+            200,
+            460
+          ],
+          "max_ground_dist": 2.5,
+          "near_object_suppress_dist": 0.3,
+          "free_space_cols": [
+            60,
+            580
+          ],
+          "free_space_bins": 9,
+          "profile_isolated_bin_margin": 0.5
+        }
+      }
+    },
+    "links": [
+      [
+        "app.desired_steering",
+        "platform.desired_steering"
+      ],
+      [
+        "platform.emergency_stop",
+        "app.emergency_stop"
+      ],
+      [
+        "platform.pose2d",
+        "app.pose2d"
+      ],
+      [
+        "platform.rotation",
+        "app.rotation"
+      ],
+      [
+        "serial.raw",
+        "platform.esp_data"
+      ],
+      [
+        "platform.esp_data",
+        "serial.raw"
+      ],
+      [
+        "platform.gps_serial",
+        "gps.raw"
+      ],
+      [
+        "gps.nmea_data",
+        "app.nmea_data"
+      ],
+      [
+        "timer.tick",
+        "platform.tick"
+      ],
+      [
+        "platform.bumpers_front",
+        "app.bumpers_front"
+      ],
+      [
+        "platform.bumpers_rear",
+        "app.bumpers_rear"
+      ],
+      [
+        "oak.nn_mask",
+        "app.nn_mask"
+      ],
+      [
+        "oak.depth",
+        "obstdet3d_zones.depth"
+      ],
+      [
+        "oak.orientation_list",
+        "obstdet3d_zones.orientation_list"
+      ],
+      [
+        "obstdet3d_zones.obstacle_zones",
+        "app.obstacle_zones"
+      ],
+      [
+        "obstdet3d_zones.ground_hazard",
+        "app.ground_hazard"
+      ],
+      [
+        "obstdet3d_zones.depth_profile",
+        "app.depth_profile"
+      ],
+      [
+        "oak.qr_code",
+        "osm_router.qr_code"
+      ],
+      [
+        "gps.nmea_data",
+        "osm_router.nmea_data"
+      ],
+      [
+        "platform.pose2d",
+        "osm_router.pose2d"
+      ],
+      [
+        "platform.rotation",
+        "osm_router.rotation"
+      ],
+      [
+        "osm_router.route_hint",
+        "app.route_hint"
+      ],
+      [
+        "platform.emergency_stop",
+        "osm_router.emergency_stop"
+      ]
+    ]
+  }
+}
