@@ -277,6 +277,44 @@ DEFAULT_ALLOWED_HIGHWAY = [
 # Multiplies the length of an edge. >1 means "usable, but prefer not to".
 # All values are clamped to >=1.0 when the graph is built, so the A*
 # straight-line heuristic stays admissible.
+# Half-width of the drivable surface, in metres, by highway type - used
+# ONLY to turn "distance to the nearest mapped centreline" into "how far
+# past the edge of the road am I", which is the number that decides
+# whether the robot is off the road. See RoadGraph.seg_halfwidth.
+#
+# OSM's own `width` tag is used wherever it exists, but it is present on
+# only 2% of the ways in the Suchdol and Stromovka extracts, so a
+# per-type default carries almost all of the work. These are deliberately
+# GENEROUS (a bit wider than the typical real surface): being wrong in
+# the tolerant direction costs a late reaction, being wrong in the tight
+# direction means fighting the road mask while the robot is legitimately
+# on the road, which is worse and harder to notice.
+#
+# Not surveyed - they are conventional widths for these types. The one
+# that matters most at Stromovka is `footway`, which is 54% of that
+# extract's ways.
+DEFAULT_HIGHWAY_HALFWIDTH = {
+    'footway': 1.2,
+    # `path` is NOT a narrow footway - at Stromovka it is the narrow one.
+    # Of the 51 width-tagged ways in that extract, the 2 tagged `path`
+    # are 0.5 and 1.0m wide, against a footway median of 3.0m. Carrying
+    # the footway figure here made off_road_m under-report on exactly
+    # the paths where leaving the road is easiest.
+    'path': 0.6,
+    'steps': 1.0,
+    'cycleway': 1.5,
+    'bridleway': 1.5,
+    'pedestrian': 2.5,
+    'track': 2.0,
+    'service': 2.5,
+    'living_street': 3.0,
+    'residential': 3.0,
+    'unclassified': 3.0,
+    'tertiary': 3.5,
+    'secondary': 4.0,
+}
+DEFAULT_HALFWIDTH_M = 2.0
+
 DEFAULT_HIGHWAY_PENALTY = {
     'footway': 1.0,
     'pedestrian': 1.0,
@@ -396,6 +434,42 @@ class Route:
 
         self.junction_s = [float(self.cum[i]) for i in range(len(self.xy))
                            if self.junction[i] or self.corner[i]]
+        # how sharp each of those turns is (radians). A 35deg bend and a
+        # 90deg T both need junction treatment, but not the same speed -
+        # see _guidance's speed cap.
+        # How sharp each of those turns is (radians). This number sets the
+        # speed cap at the fork, so what it means matters: it is how far
+        # THIS ROUTE bends here, not how many ways meet here.
+        #
+        # It used to be max(geometric, 90deg) at any topological junction -
+        # i.e. every place two paths meet was treated as a potential T and
+        # capped at junction_speed_limit, even where the plan goes dead
+        # straight through. On campus and park paths, which fork every
+        # 15-25m, that is most of the route. Measured over the 2026-09-05
+        # runs: 52% of junction-mode episodes had a real road-bearing
+        # change under 10 degrees, 49% of all junction-mode time (767s of
+        # 1553s) was spent capped at 0.30 m/s for turns under 25 degrees,
+        # and the cap was the binding constraint on 51% of every forward
+        # cycle in the session. That is the reported "slows too much
+        # during turns, even though they are not sharp" - and it was never
+        # a fail-safe, it was this line.
+        #
+        # The geometry is known here and is the honest answer, so use it.
+        # The 90deg assumption survives only where the geometry genuinely
+        # cannot be computed (an endpoint, or segments too short to have a
+        # direction), which is the case it was written for.
+        self.junction_turn = {}
+        for i in range(len(self.xy)):
+            if not (self.junction[i] or self.corner[i]):
+                continue
+            turn = math.pi / 2                      # geometry unknown - assume it could be a T
+            if 0 < i < len(self.xy) - 1:
+                before = self.xy[i] - self.xy[i - 1]
+                after = self.xy[i + 1] - self.xy[i]
+                if min(np.hypot(*before), np.hypot(*after)) >= 0.5:
+                    turn = abs(normalize_angle(math.atan2(after[0], after[1])
+                                                - math.atan2(before[0], before[1])))
+            self.junction_turn[float(self.cum[i])] = turn
 
     def __len__(self):
         return len(self.points_ll)
@@ -460,21 +534,93 @@ class Route:
         cross = tx * (p[1] - closest[k, 1]) - ty * (p[0] - closest[k, 0])
         return s, -float(cross), float(dist[k])
 
-    def next_junction_dist(self, s):
+    def next_turn_angle(self, s, min_turn_rad=0.0):
+        """How sharp the next turn ahead is (radians), or 0 if none.
+        min_turn_rad skips straight-through forks, same as
+        next_junction_dist - the two must agree on what counts as a turn
+        or the speed cap ends up describing a different fork from the one
+        the lookahead clamp is aiming at."""
+        for js in self.junction_s:
+            if js > s + 0.5:
+                turn = self.junction_turn.get(js, math.pi / 2)
+                if min_turn_rad > 0 and turn < min_turn_rad:
+                    continue
+                return turn
+        return 0.0
+
+    def next_turn_signed(self, s, min_turn_rad=0.0):
+        """Signed angle of the next qualifying turn ahead: positive when
+        the route bends LEFT (anticlockwise), negative right. None when
+        there is no turn left or its geometry is unknown.
+
+        Signed, unlike next_turn_angle, because the follower needs the
+        DIRECTION and that is the one thing about a junction the GPS bias
+        cannot corrupt - it is a property of the polyline."""
+        for js in self.junction_s:
+            turn = self.junction_turn.get(js, math.pi / 2)
+            if js <= s + 0.5 or (min_turn_rad > 0 and turn < min_turn_rad):
+                continue
+            i = int(np.searchsorted(self.cum, js))
+            if i <= 0 or i >= len(self.xy) - 1:
+                return None
+            before = self.xy[i] - self.xy[i - 1]
+            after = self.xy[i + 1] - self.xy[i]
+            if min(np.hypot(*before), np.hypot(*after)) < 0.5:
+                return None
+            # +ve = anticlockwise = left, matching the platform's steering
+            return normalize_angle(math.atan2(after[0], after[1])
+                                    - math.atan2(before[0], before[1])) * -1.0
+        return None
+
+    def next_turn_exit_bearing(self, s, min_turn_rad=0.0, probe_m=4.0):
+        """Compass bearing (radians) the route LEAVES the next qualifying
+        turn on, measured from the turn node to a point probe_m further
+        along - a few metres rather than the immediate segment, which can
+        be a node-spacing stub with a meaningless direction. None when
+        there is no such turn. A property of the polyline alone, so the
+        per-run GPS offset cannot touch it; the follower closes its
+        junction hint on it (see tulak_obstacle._route_turn_hint)."""
+        for js in self.junction_s:
+            turn = self.junction_turn.get(js, math.pi / 2)
+            if js <= s + 0.5 or (min_turn_rad > 0 and turn < min_turn_rad):
+                continue
+            p0 = self.xy_at(js)
+            p1 = self.xy_at(min(self.total, js + probe_m))
+            dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+            if math.hypot(dx, dy) < 0.5:
+                return None
+            return math.atan2(dx, dy)            # x=east, y=north -> compass bearing
+        return None
+
+    def next_junction_dist(self, s, min_turn_rad=0.0):
         """Distance from s forward to the next TURN - a junction or a sharp
         bend, see self.corner - on the route, or
         the distance to the route end if there is none left (arriving is,
         for the purposes of the lookahead clamp and the authority ramp,
-        the same kind of event as a fork: a place not to overshoot)."""
+        the same kind of event as a fork: a place not to overshoot).
+
+        min_turn_rad skips forks the route runs straight through. A place
+        where paths merely MEET is not an event for a robot that is not
+        changing direction there: it needs no shortened lookahead, no
+        raised steering ceiling, no reduced speed, and - most of all - no
+        handover of authority from the road mask to a 1-3m GPS fix. The
+        mask centres better than the fix does on a straight path, which
+        is exactly what cruise_authority being lower than
+        junction_authority already says. 0 keeps every fork (previous
+        behaviour)."""
         for js in self.junction_s:
             if js > s + 0.5:
+                if min_turn_rad > 0 and self.junction_turn.get(js, math.pi / 2) < min_turn_rad:
+                    continue
                 return js - s
         return max(0.0, self.total - s)
 
-    def dist_since_junction(self, s):
+    def dist_since_junction(self, s, min_turn_rad=0.0):
         best = None
         for js in self.junction_s:
             if js <= s + 0.5:
+                if min_turn_rad > 0 and self.junction_turn.get(js, math.pi / 2) < min_turn_rad:
+                    continue
                 best = js
         if best is None:
             return float('inf')
@@ -491,7 +637,7 @@ class RoadGraph:
 
     def __init__(self, map_data, allowed=None, highway_penalty=None, surface_penalty=None,
                  default_highway_penalty=1.5, default_surface_penalty=1.2,
-                 corner_angle_deg=35.0):
+                 corner_angle_deg=35.0, highway_halfwidth=None, default_halfwidth=DEFAULT_HALFWIDTH_M):
         # bend sharp enough to be treated as a turn - see Route.__init__
         self.corner_angle_rad = math.radians(corner_angle_deg)
         allowed = set(allowed or DEFAULT_ALLOWED_HIGHWAY)
@@ -511,8 +657,10 @@ class RoadGraph:
         self.node_xy = {}
         self.node_ll = {}
         self.adj = {}
-        seg_a, seg_b, seg_pen, seg_nodes = [], [], [], []
+        seg_a, seg_b, seg_pen, seg_nodes, seg_half = [], [], [], [], []
         self.skipped_ways = 0
+        halfwidth_by_highway = dict(DEFAULT_HIGHWAY_HALFWIDTH)
+        halfwidth_by_highway.update(highway_halfwidth or {})
 
         for way in map_data['ways']:
             penalty = _way_penalty(way['tags'], allowed, highway_penalty, surface_penalty,
@@ -520,6 +668,14 @@ class RoadGraph:
             if penalty is None:
                 self.skipped_ways += 1
                 continue
+            # how wide this way's surface is, for the off-road test - see
+            # DEFAULT_HIGHWAY_HALFWIDTH. An explicit width tag wins where
+            # it exists; anything unparseable falls through to the type.
+            half = halfwidth_by_highway.get(way['tags'].get('highway'), default_halfwidth)
+            try:
+                half = max(half, float(way['tags']['width']) / 2.0)
+            except (KeyError, TypeError, ValueError):
+                pass
             ids = [n for n in way['nodes'] if n in nodes_ll]
             for nid in ids:
                 if nid not in self.node_xy:
@@ -541,11 +697,13 @@ class RoadGraph:
                 seg_b.append((vx, vy))
                 seg_pen.append(penalty)
                 seg_nodes.append((u, v))
+                seg_half.append(half)
 
         self.seg_a = np.asarray(seg_a, dtype=float).reshape(-1, 2)
         self.seg_b = np.asarray(seg_b, dtype=float).reshape(-1, 2)
         self.seg_penalty = np.asarray(seg_pen, dtype=float)
         self.seg_nodes = seg_nodes
+        self.seg_halfwidth = np.asarray(seg_half, dtype=float)
         d = self.seg_b - self.seg_a
         self._seg_d = d
         self._seg_len2 = d[:, 0] ** 2 + d[:, 1] ** 2
@@ -838,6 +996,35 @@ class OSMRouter(Node):
         self.junction_overshoot_m = config.get('junction_overshoot_m', 3.0)
         self.junction_zone_m = config.get('junction_zone_m', 12.0)
         self.junction_exit_m = config.get('junction_exit_m', 6.0)
+        # How much the route has to bend at a fork before it is treated as
+        # a turn at all - see Route.next_junction_dist. Everything junction
+        # mode does (short lookahead, 40deg steering ceiling, 0.85
+        # authority, reduced speed) is the right answer to "a turn is
+        # coming" and the wrong answer to "two paths meet here and we are
+        # going straight on". Below this the fork is ignored and the robot
+        # cruises through it, which is what it is doing anyway.
+        # 0 restores the previous behaviour (every fork is an event).
+        # Deliberately well under gentle_turn_angle_deg: this decides
+        # whether there is a turn, not how sharp it is, and a 20deg bend
+        # on a wide path still deserves the corridor treatment rather than
+        # nothing at all.
+        self.junction_min_turn = math.radians(config.get('junction_min_turn_deg', 0.0))
+        # metres past the edge of the nearest mapped road - see _gps_update.
+        # None until the first fix; 0.0 means "on a road".
+        self.off_road_m = None
+        self.road_halfwidth_m = None
+        # off_road_m at which the aim point is pulled all the way in to
+        # lookahead_min_m. 0 disables (cross-track drives the ramp alone).
+        self.offroad_lookahead_m = config.get('offroad_lookahead_m', 0.0)
+        # Fraction of misaligned_turn_angle the heading must fall back to
+        # before the "large heading error IS a turn" latch releases - see
+        # _junction_approach. 1.0 restores the previous, un-hysteretic
+        # behaviour.
+        self.misaligned_turn_release_frac = config.get('misaligned_turn_release_frac', 1.0)
+        # how far past a turn node the exit bearing is measured - see
+        # Route.next_turn_exit_bearing
+        self.turn_exit_probe_m = config.get('turn_exit_probe_m', 4.0)
+        self._misaligned_latched = False
 
         # --- how much the follower should trust the route bearing ---
         # See the "division of labour" section of the module docstring.
@@ -865,6 +1052,13 @@ class OSMRouter(Node):
         self.corridor_max_aim_offset = math.radians(config.get('corridor_max_aim_offset_deg', 50))
         self.junction_max_aim_offset = math.radians(config.get('junction_max_aim_offset_deg', 110))
         self.junction_speed_limit = config.get('junction_speed_limit', 0.3)
+        # speed cap interpolates between these two by how sharp the turn is
+        # heading error past which the follower is told it is TURNING, not
+        # cruising - see _heading_misalignment
+        self.misaligned_turn_angle = math.radians(config.get('misaligned_turn_angle_deg', 55))
+        self.gentle_turn_speed = config.get('gentle_turn_speed', 0.45)
+        self.gentle_turn_angle = math.radians(config.get('gentle_turn_angle_deg', 35))
+        self.sharp_turn_angle = math.radians(config.get('sharp_turn_angle_deg', 80))
         self.recovery_speed_limit = config.get('recovery_speed_limit', 0.3)
 
         # --- corridor monitor ---
@@ -994,7 +1188,9 @@ class OSMRouter(Node):
             surface_penalty=config.get('surface_penalty'),
             default_highway_penalty=config.get('default_highway_penalty', 1.5),
             default_surface_penalty=config.get('default_surface_penalty', 1.2),
-            corner_angle_deg=config.get('corner_angle_deg', 35.0))
+            corner_angle_deg=config.get('corner_angle_deg', 35.0),
+            highway_halfwidth=config.get('highway_halfwidth'),
+            default_halfwidth=config.get('default_halfwidth_m', DEFAULT_HALFWIDTH_M))
         bbox = map_data.get('bbox')
         # The area is printed at boot on purpose: running the wrong map for
         # the site is silent everywhere else, and its symptom (see
@@ -1377,6 +1573,27 @@ class OSMRouter(Node):
         snap = self.graph.snap(lat, lon)
         dist_any_way = snap[2] if snap else float('inf')
 
+        # --- how far PAST THE EDGE of the nearest road the robot is ---
+        # Distance to a centreline is not the same question. A 6m service
+        # road tolerates 2.5m of it; a 2.4m Stromovka footway does not,
+        # and 54% of that extract is footway. Subtracting the way's own
+        # half-width (see DEFAULT_HIGHWAY_HALFWIDTH) turns one number into
+        # the number that actually decides whether the robot has left the
+        # road - which, at Robotour, ends the run.
+        #
+        # Deliberately measured against the NEAREST way rather than the
+        # planned one: drifting onto a legal parallel path is not going
+        # off-road, and is already handled a few lines below by re-
+        # planning. cross_track stays what it was - lane discipline on the
+        # plan - and is what the follower's corridor bias keeps using.
+        if snap is not None and len(self.graph.seg_halfwidth):
+            half = float(self.graph.seg_halfwidth[snap[0]])
+            self.off_road_m = max(0.0, dist_any_way - half)
+            self.road_halfwidth_m = half
+        else:
+            self.off_road_m = 0.0 if snap is None else dist_any_way
+            self.road_halfwidth_m = None
+
         if dist_any_way > self.lost_dist_m:
             if self._lost_since is None:
                 self._lost_since = self.time
@@ -1451,13 +1668,69 @@ class OSMRouter(Node):
             self._stall_anchor_s, self._stall_anchor_time = self.s, self.time
 
     # --- output ---------------------------------------------------
+    def _heading_misalignment(self):
+        """How far the robot is pointing off the route's own direction here,
+        in radians, or None if the heading is unknown.
+
+        This is a TURN that has to be executed, and nothing else in
+        _guidance sees it: junction proximity is about distance to the next
+        mapped fork, so a robot facing 90 or 180 deg away from its route on
+        a perfectly straight stretch is treated as ordinary cruising - 20
+        deg of steering ceiling, 0.45 authority - and creeps round in a
+        long arc while the road mask, which has no idea a route exists,
+        pulls it straight.
+
+        Measured over the 2026-09-05 runs: one leg spent 75 seconds at
+        119-175 deg off the route axis, and the first two minutes of the
+        worst run turned 1645 deg over 26 m of travel (63 deg/m against a
+        7-15 deg/m norm) - the reported circling at the start, and the
+        "wrong way for several seconds then a sharp turn" on the wide road
+        by the dormitory. Both are the same thing: a large heading error
+        that no mode reacted to."""
+        bearing = self._compass_bearing()
+        if bearing is None or self.route is None:
+            return None
+        tangent = self.route.tangent_at(self.s)
+        return abs(normalize_angle(bearing - math.atan2(tangent[0], tangent[1])))
+
     def _junction_approach(self):
         """0..1 - how much this cycle is "at a fork" rather than "cruising a
         path". Ramps up over junction_zone_m before a planned junction and
         stays at 1 for junction_exit_m after it, because completing the turn
         out of a fork needs the same commitment as entering it."""
-        to_junction = self.route.next_junction_dist(self.s)
-        if self.route.dist_since_junction(self.s) < self.junction_exit_m:
+        # Only forks the route actually TURNS at count - see
+        # next_junction_dist. A place where paths merely meet is not an
+        # event for a robot going straight through it.
+        mt = self.junction_min_turn
+        to_junction = self.route.next_junction_dist(self.s, mt)
+        # A large heading error IS a turn, wherever it happens - see
+        # _heading_misalignment. Treated as fully "at a fork" so it gets the
+        # steering ceiling and authority a turn needs instead of cruising
+        # round in an arc.
+        misalign = self._heading_misalignment()
+        # Hysteresis, because this gate flips a lot more than the geometry
+        # it is meant to describe. It keys off the live compass heading,
+        # which swings through tens of degrees during an avoidance
+        # maneuver, and every flip changes authority (0.45 <-> 0.85), the
+        # steering ceiling (20 <-> 40 deg) and - through road_axis_err -
+        # the follower's mask_trust (1.00 <-> 0.25). Field case,
+        # 2026-09-06 run 115237 t=405-425: junction and corridor alternated
+        # every few seconds through a 20-second avoidance thrash, so the
+        # follower's whole control law changed underneath it repeatedly
+        # while it was trying to resolve a tight spot.
+        #
+        # Once latched it takes misaligned_turn_release_frac of the entry
+        # angle to let go, so a heading wobbling around the threshold
+        # stays in one mode instead of switching on every sample.
+        if misalign is not None:
+            release = self.misaligned_turn_angle * self.misaligned_turn_release_frac
+            if misalign > self.misaligned_turn_angle:
+                self._misaligned_latched = True
+            elif misalign < release:
+                self._misaligned_latched = False
+            if self._misaligned_latched:
+                return 1.0, to_junction
+        if self.route.dist_since_junction(self.s, mt) < self.junction_exit_m:
             return 1.0, to_junction
         if to_junction < self.junction_zone_m and self.junction_zone_m > 0:
             return 1.0 - to_junction / self.junction_zone_m, to_junction
@@ -1563,18 +1836,130 @@ class OSMRouter(Node):
         # junction_overshoot_m: a long lookahead across a corner is exactly
         # what makes a robot cut it, and the inside of a corner in a park
         # is grass.
+        # Note what happens at to_junction ~= lookahead_m: the aim point
+        # lands ON the junction node, which is the least informative place
+        # it can be. The bearing to a corner carries nothing about which
+        # way the route leaves it - only the robot's own lateral offset -
+        # so the follower steers to the centreline for several seconds and
+        # then has to take the whole turn inside the fork. Measured over
+        # the 2026-09-05 runs, the aim offset sat pinned at 26-32 deg for
+        # the nine seconds before a 121 deg turn while the commanded
+        # steering stayed within +-5 deg, and only swung once the node had
+        # been passed: the reported "went the wrong way for several
+        # seconds, then made a sharp turn when it was almost too late".
+        # junction_overshoot_m is the lever - it is how far PAST the
+        # corner the aim point is allowed to reach, and therefore how
+        # early the turn becomes visible at all. _limit_aim_offset below
+        # is what stops that reach turning into corner-cutting.
         lookahead = max(self.lookahead_min_m,
                         min(self.lookahead_m, to_junction + self.junction_overshoot_m))
+        # Off the corridor, aim CLOSER. The steepest return a pure-pursuit
+        # aim point can ever ask for is atan(cross_track / lookahead), so
+        # at the cruising 8m lookahead a 2.5m excursion is bounded at
+        # 17deg however much authority the route is given - and measured
+        # over the 2026-09-05 runs the robot was already within 4.1deg of
+        # that aim while more than 1.5m off. It was not ignoring the
+        # route; it was converging as fast as the geometry permitted,
+        # which is slowly, which is the reported "drove parallel to the
+        # road on the grass for a very long time".
+        #
+        # RECOVERING already shortens to recovery_lookahead_m for exactly
+        # this reason. This reaches for the same number continuously,
+        # ramping over the same corridor_soft_m..corridor_hard_m span the
+        # corridor monitor already uses, instead of only after
+        # corridor_hard_confirm_sec of confirmed excursion. At 2.5m off
+        # with the shipped span the aim comes in to 6.4m (21deg); at 4m
+        # it reaches recovery_lookahead_m (45deg).
+        span = self.corridor_hard_m - self.corridor_soft_m
+        if span > 0 and self.lookahead_min_m < lookahead:
+            excursion = min(1.0, max(0.0, (abs(self.cross_track) - self.corridor_soft_m) / span))
+            # ...driven by whichever of the two excursion measures is more
+            # urgent. cross_track is lane discipline on the PLAN and can
+            # be large while the robot is still legitimately on a wide
+            # road; off_road_m says it is on grass, which at Robotour ends
+            # the run. Neither subsumes the other, so take the max rather
+            # than choosing.
+            if self.off_road_m is not None and self.offroad_lookahead_m > 0:
+                excursion = max(excursion, min(1.0, self.off_road_m / self.offroad_lookahead_m))
+            # Aims all the way in to lookahead_min_m rather than stopping
+            # at recovery_lookahead_m: the return angle is atan(offset /
+            # lookahead), so the lookahead IS the return angle, and the
+            # distance driven off the road is offset/sin(that angle) -
+            # independent of speed. Shortening the aim is therefore the
+            # only lever that actually reduces METRES of road-leaving;
+            # slowing down reduces how deep the excursion gets, not how
+            # far it runs.
+            target = min(self.recovery_lookahead_m, self.lookahead_min_m)                 if self.off_road_m else self.recovery_lookahead_m
+            lookahead += excursion * (max(self.lookahead_min_m, target) - lookahead)
+            lookahead = max(self.lookahead_min_m, lookahead)
         # ...and it must not point across an S-bend either - see
         # _limit_aim_offset. A turn IS expected at a fork, so the bound
         # opens up as `approach` rises.
-        lookahead = self._limit_aim_offset(
-            lookahead, lerp(self.corridor_max_aim_offset, self.junction_max_aim_offset))
+        # ...and while the robot is already OFF the road, the junction
+        # allowance does not apply. junction_max_aim_offset exists so a
+        # fork can ask for a real turn; out on the grass it instead lets
+        # the aim point point across whatever the robot has to cross to
+        # get back, which is how a junction turn becomes an excursion.
+        # Measured over the 2026-09-06 runs, four of the eleven sustained
+        # off-road stretches were in junction mode with the commanded
+        # steering pointing AWAY from the route (-0.9 to -3.8 deg), even
+        # though the follower's off-road takeover was already active - it
+        # only applies in the follower's corridor branch, and a junction
+        # aim it cannot argue with is upstream of that.
+        max_offset = lerp(self.corridor_max_aim_offset, self.junction_max_aim_offset)
+        if self.off_road_m is not None and self.off_road_m > 0:
+            max_offset = min(max_offset, self.corridor_max_aim_offset)
+        lookahead = self._limit_aim_offset(lookahead, max_offset)
         degraded = self._gps_degradation()
-        speed_limit = self.junction_speed_limit if approach > 0.5 else None
+        # --- the next real turn, as GEOMETRY rather than as an aim point ---
+        # Everything derived from where the robot is thought to BE is
+        # contaminated. Measured over the 2026-09-06 test4 runs, the GPS
+        # fix sits at a near-constant offset from the map for the whole of
+        # a run - 3.17m in run 154422 with a scatter of 0.68m and a
+        # direction that drifts 0 deg between the run's two halves, 2.46m
+        # in 160437 drifting 1 deg. That is a bias, not noise: no EMA, no
+        # gain choice and no amount of slow-loop design removes a constant.
+        # With it, cross_track says the robot is metres off a road it is
+        # driving down the middle of, and the correction pushes it off the
+        # other side - which is what put it into the wall by the
+        # dormitories.
+        #
+        # What survives the bias is the shape of the plan: WHICH WAY the
+        # route turns next and ROUGHLY how far ahead. The turn angle comes
+        # from the polyline, so it does not depend on the fix at all, and
+        # a 3m along-track error inside a 12m approach zone is tolerable.
+        # Note the aim-point BEARING does not survive: at an 8m lookahead
+        # a 3m lateral bias is 21 deg of false bearing, which is most of a
+        # junction turn.
+        turn_signed = self.route.next_turn_signed(self.s, self.junction_min_turn)
+        exit_bearing = self.route.next_turn_exit_bearing(self.s, self.junction_min_turn,
+                                                         self.turn_exit_probe_m)
+        hint = {
+            'turn_dir_deg': None if turn_signed is None else round(math.degrees(turn_signed), 1),
+            'turn_dist_m': round(to_junction, 1),
+            'exit_bearing_deg': None if exit_bearing is None
+                                else round(math.degrees(exit_bearing) % 360.0, 1),
+        }
+
+        # Speed at a turn scaled by how sharp it is, not a flat cap. With
+        # corners counted as turns (which they must be - see Route), dense
+        # campus paths put the robot in junction mode about half the time,
+        # and a flat 0.3 m/s there was measured holding 48% of all forward
+        # cycles at that speed. A 35deg bend does not need what a 90deg
+        # fork needs.
+        speed_limit = None
+        if approach > 0.5:
+            turn = self.route.next_turn_angle(self.s, self.junction_min_turn) or math.pi / 2
+            misalign = self._heading_misalignment()
+            if misalign is not None and misalign > self.misaligned_turn_angle:
+                turn = max(turn, misalign)      # turning the robot round IS the sharp turn
+            sharp = max(0.0, min(1.0, (turn - self.gentle_turn_angle)
+                                  / max(1e-6, self.sharp_turn_angle - self.gentle_turn_angle)))
+            speed_limit = self.gentle_turn_speed + sharp * (self.junction_speed_limit
+                                                            - self.gentle_turn_speed)
         if degraded > 0:
             speed_limit = min(speed_limit or 1e9, self.gps_degraded_speed_limit)
-        return {
+        hint.update({
             'mode': ('junction' if approach > 0.5 else 'corridor')
                      if degraded < 1 else 'corridor',
             'approach': round(approach, 3),
@@ -1598,7 +1983,8 @@ class OSMRouter(Node):
             # Slowing into a fork buys time for the turn and shortens every
             # stopping distance downstream. None = no cap.
             'speed_limit': speed_limit,
-        }
+        })
+        return hint
 
     def _publish_hint(self):
         hint = {
@@ -1626,6 +2012,16 @@ class OSMRouter(Node):
             hint['hold'] = 'creep'
         elif self.state in (RouteState.ARRIVED, RouteState.LOST, RouteState.FAILED):
             hint['hold'] = 'stop'
+
+        # The off-road distance is published unconditionally, in every
+        # state that has a fix - unlike cross_track, which is withheld
+        # without a route. Leaving the road is a terminal event whether or
+        # not there is currently a plan to follow.
+        hint['off_road_m'] = round(self.off_road_m, 2) if self.off_road_m is not None else None
+        # How wide the surface under the robot is - published so the
+        # follower can express cross-track as a fraction of the way to the
+        # road EDGE rather than in bare metres. See _route_corridor_bias.
+        hint['road_halfwidth_m'] = self.road_halfwidth_m
 
         age = self._gps_age_sec()
         hint['gps_age_sec'] = None if age is None else round(age, 1)
@@ -1673,7 +2069,7 @@ class OSMRouter(Node):
                     'remaining_m': round(remaining, 1),
                     'road_bearing_deg': round(math.degrees(
                         math.atan2(tangent[0], tangent[1])) % 360.0, 1),
-                    'junction_m': round(self.route.next_junction_dist(self.s), 1),
+                    'junction_m': round(self.route.next_junction_dist(self.s, self.junction_min_turn), 1),
                     'progress_m': round(self.s, 1),
                     'plan_seq': self.plan_seq,
                 })
@@ -1681,6 +2077,7 @@ class OSMRouter(Node):
                     # cannot be measured without a fix, and a frozen value
                     # is a constant steering offset with no feedback
                     hint['cross_track_m'] = None
+                    hint['off_road_m'] = None
                 hint['authority'] = round(hint['authority'], 3)
                 hint['lookahead_m'] = round(hint['lookahead_m'], 1)
         self.publish('route_hint', hint)
@@ -1697,7 +2094,7 @@ class OSMRouter(Node):
         print(self.time, 'ROUTE: %-10s %-8s progress=%.0f/%.0fm cross=%+.1fm next_junction=%.0fm '
                           'authority=%.2f steer_limit=%.0fdeg aim=%s'
                % (self.state, hint.get('mode', '-'), self.s, self.route.total, self.cross_track,
-                  self.route.next_junction_dist(self.s), hint['authority'],
+                  self.route.next_junction_dist(self.s, self.junction_min_turn), hint['authority'],
                   hint.get('steer_limit_deg', 0),
                   'none' if hint['lat'] is None else '%.6f,%.6f' % (hint['lat'], hint['lon'])))
 

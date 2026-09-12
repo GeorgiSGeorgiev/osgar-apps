@@ -265,9 +265,17 @@ def draw_free_space_bins(depth_panel, app, zones, scale):
 
     bar_top, bar_bottom = y1_all + 4, y1_all + 18
     total_weight, weighted_x = 0.0, 0.0
+    half_corridor = (app.corridor_half_width_m + app.corridor_margin_m
+                      if getattr(app, 'corridor_check', False) else 0.0)
     for i in range(n):
         x0, x1 = int(edges[i] * scale), int(edges[i + 1] * scale)
         d = app.depth_profile[i] if app.depth_profile else None
+        # a white cap marks a bin whose reading lands inside the robot's
+        # own swept width - i.e. one _corridor_scan is allowed to stop on
+        if half_corridor > 0 and d is not None and app.depth_profile:
+            bearing = app._profile_bin_bearing(i, n)
+            if abs(d * math.sin(bearing)) <= half_corridor:
+                cv2.rectangle(depth_panel, (x0, bar_top - 5), (x1, bar_top - 1), (255, 255, 255), -1)
         if d is None:
             color = (80, 80, 80)
         elif d <= free_space_min_dist:
@@ -325,7 +333,35 @@ def build_hud_lines(dt, app, zones, reason_log, osm=None):
         f"   aim={math.degrees(app._free_space_steering()):+.1f}deg"
     )
 
-    lines.append(f"ground_hazard: active={app.ground_hazard_active}  streak={app.ground_hazard_streak}")
+    lines.append(f"ground_hazard: active={app.ground_hazard_active}  streak={app.ground_hazard_streak}"
+                  f"   near-obstacle: active={getattr(app, 'ground_near_active', False)}"
+                  f" streak={getattr(app, 'ground_near_streak', 0)}")
+
+    # The head-on channel the L/C/R zones cannot provide - closest thing
+    # inside the robot's own swept width, from the profile bins (see
+    # tulak_obstacle._corridor_scan). This is the line to watch when the
+    # robot drives into something the zones called clear.
+    corridor = getattr(app, 'corridor_dist', None)
+    if getattr(app, 'corridor_check', False):
+        half = app.corridor_half_width_m + app.corridor_margin_m
+        verdict = 'clear'
+        if corridor is not None:
+            verdict = ('STOP' if corridor < app.stop_dist
+                        else 'BLOCKED' if corridor < app.turning_dist else 'clear')
+        lines.append(f"corridor (+-{half:.2f}m): {fmt_dist(corridor)}  {verdict}")
+    else:
+        lines.append("corridor: disabled")
+
+    # The continuous avoidance push and the junction hint - the two terms
+    # added 2026-09-11. repel is what should move a pole out of the robot's
+    # path well before the discrete maneuver; the hint is closed on heading,
+    # so it should fall to zero once Matty faces the exit bearing.
+    repel = math.degrees(app._corridor_repulsion()) if hasattr(app, '_corridor_repulsion') else 0.0
+    hint = math.degrees(app._route_turn_hint()) if hasattr(app, '_route_turn_hint') else 0.0
+    eb = getattr(app, 'route_exit_bearing', None)
+    lines.append(f"steer terms: repel {repel:+5.1f}deg   turn hint {hint:+5.1f}deg"
+                 f"   exit bearing {'--' if eb is None else '%.0fdeg' % (math.degrees(eb) % 360)}"
+                 f"   pitch source {getattr(zones, 'pitch_source', 'euler')}")
 
     pitch_deg = math.degrees(zones.smoothed_pitch)
     lines.append(
@@ -374,6 +410,21 @@ def build_hud_lines(dt, app, zones, reason_log, osm=None):
             parts.append(app.route_guidance_mode.upper())
         if app.route_authority is not None:
             parts.append('authority=%.2f' % app.route_authority)
+        # THE number that ends a Robotour run: metres past the edge of the
+        # nearest mapped road (0 = provably on one). Shown even at 0 so
+        # its absence is distinguishable from "on the road".
+        off_m = getattr(app, 'route_off_road_m', None)
+        parts.append('off_road=%s' % ('n/a' if off_m is None else '%.2fm' % off_m))
+        offroad = app._route_offroad_frac() if hasattr(app, '_route_offroad_frac') else 0.0
+        if offroad > 0:
+            # how much of the steering the map has taken over, and the
+            # speed ceiling that came with it - see _drive_steering /
+            # _offroad_speed_cap
+            parts.append('OFFROAD=%.2f' % offroad)
+            parts.append('route_takeover=%.2f' % (offroad * app.route_offroad_authority))
+            parts.append('v_cap=%.2f' % app._offroad_speed_cap())
+        if getattr(app, 'offroad_hold_active', False):
+            parts.append('OFF-ROAD CRAWL')
         herr = app._route_heading_error()
         if herr is not None:
             # the two numbers behind item 29: how far the camera is off the

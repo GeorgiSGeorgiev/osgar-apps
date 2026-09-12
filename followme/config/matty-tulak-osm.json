@@ -18,7 +18,8 @@
           "nn_mask",
           "route_hint",
           "nmea_data",
-          "depth_profile"
+          "depth_profile",
+          "joint_angle"
         ],
         "out": [
           "desired_steering"
@@ -81,10 +82,10 @@
           "speed_clearance_ceiling": 2.0,
           "speed_side_clearance_factor": 0.6,
           "max_speed_accel_mps2": 0.3,
-          "free_space_weight": 0.5,
-          "free_space_lead_margin": 1.8,
+          "free_space_weight": 0.6,
+          "free_space_lead_margin": 2.2,
           "edge_bins_watched": 1,
-          "edge_correction_min_deg": 8,
+          "edge_correction_min_deg": 12,
           "edge_correction_max_deg": 35,
           "edge_correction_center_in_gap": true,
           "avoidance_bin_scale_floor": 0.5,
@@ -116,9 +117,9 @@
           "blind_creep_speed": 0.15,
           "blind_creep_max_dist_m": 0.5,
           "route_hold_creep_speed": 0.0,
-          "route_cross_track_gain_deg_per_m": 3.0,
-          "route_heading_gain": 0.35,
-          "route_bias_max_deg": 15.0,
+          "route_cross_track_gain_deg_per_m": 0.0,
+          "route_heading_gain": 0.0,
+          "route_bias_max_deg": 25.0,
           "route_bias_alpha": 0.15,
           "mask_trust_full_deg": 25.0,
           "mask_trust_none_deg": 60.0,
@@ -135,7 +136,53 @@
           "rear_corner_angle_deg": 32.6,
           "swing_margin_m": 0.1,
           "swing_min_steering_deg": 10,
-          "side_zone_bearing_deg": 20.0
+          "side_zone_bearing_deg": 22.5,
+          "side_thresholds_lateral": true,
+          "side_lateral_stop_m": 0.25,
+          "side_lateral_turn_m": 0.32,
+          "joint_force_detect": true,
+          "joint_force_deg": 55.0,
+          "joint_force_confirm_frames": 3,
+          "joint_force_escape_speed": 0.12,
+          "joint_force_escape_sec": 4.0,
+          "max_joint_escapes": 2,
+          "corridor_check": true,
+          "corridor_half_width_m": 0.1775,
+          "corridor_margin_m": 0.08,
+          "ground_near_confirm_frames": 2,
+          "mask_trust_cross_full_m": 0.0,
+          "mask_trust_cross_none_m": 3.0,
+          "route_offroad_authority": 0.0,
+          "offroad_full_m": 0.3,
+          "offroad_none_m": 1.2,
+          "offroad_speed": 0.35,
+          "offroad_hold_m": 0.0,
+          "outward_damp_start_m": 0.0,
+          "outward_damp_full_m": 1.5,
+          "outward_damp_max": 0.8,
+          "turn_road_side_min_cross_m": 0.0,
+          "corridor_aim_frac": 0.0,
+          "junction_edge_yield": 0.8,
+          "realign_speed_factor": 0.6,
+          "corridor_hold_frames": 3,
+          "tube_reference_halfwidth_m": 1.2,
+          "route_turn_hint_max_deg": 10.0,
+          "route_turn_hint_lead_m": 12.0,
+          "route_turn_hint_full_angle_deg": 80.0,
+          "junction_hint_gain": 3.0,
+          "swing_beside_only": true,
+          "swing_forward_max_m": 0.05,
+          "swing_behind_max_m": 0.8,
+          "corridor_repel_gain": 2.0,
+          "corridor_repel_centre_m": 0.08,
+          "turn_around_obstacle": true,
+          "turn_around_min_lateral_m": 0.05,
+          "turn_around_lead_factor": 1.0,
+          "turn_clearance_margin_m": 0.5,
+          "turn_clearance_comfort_m": 2.0,
+          "turn_side_min_road_frac": 0.05,
+          "turn_side_road_frac_margin": 0.10,
+          "route_turn_closed_loop": true
         }
       },
       "osm_router": {
@@ -159,15 +206,15 @@
           "lookahead_m": 8.0,
           "lookahead_min_m": 3.0,
           "recovery_lookahead_m": 4.0,
-          "junction_overshoot_m": 3.0,
+          "junction_overshoot_m": 5.0,
           "junction_zone_m": 12.0,
           "junction_exit_m": 6.0,
           "cruise_authority": 0.45,
           "junction_authority": 0.85,
           "recovery_authority": 0.9,
-          "corridor_soft_m": 4.0,
-          "corridor_hard_m": 8.0,
-          "corridor_hard_confirm_sec": 6.0,
+          "corridor_soft_m": 1.5,
+          "corridor_hard_m": 4.0,
+          "corridor_hard_confirm_sec": 2.0,
           "lost_dist_m": 25.0,
           "lost_confirm_sec": 10.0,
           "cross_track_alpha": 0.4,
@@ -202,7 +249,15 @@
           "junction_max_aim_offset_deg": 110.0,
           "gps_dead_reckon_sec": 15.0,
           "gps_lost_sec": 45.0,
-          "gps_degraded_speed_limit": 0.3
+          "gps_degraded_speed_limit": 0.3,
+          "misaligned_turn_angle_deg": 55,
+          "gentle_turn_speed": 0.45,
+          "gentle_turn_angle_deg": 35,
+          "sharp_turn_angle_deg": 80,
+          "junction_min_turn_deg": 20.0,
+          "offroad_lookahead_m": 1.2,
+          "misaligned_turn_release_frac": 0.6,
+          "turn_exit_probe_m": 4.0
         }
       },
       "platform": {
@@ -315,13 +370,13 @@
         "init": {
           "vertical_fov_deg": 55,
           "max_pitch_shift_deg": 20,
-          "pitch_shift_sign": -1,
-          "pitch_offset_deg": 80.6,
+          "pitch_shift_sign": 1,
+          "pitch_offset_deg": 0.58,
           "max_pitch_error_deg": 15,
           "max_plausible_roll_deg": 30,
           "pitch_smoothing_alpha": 0.15,
           "min_shift_change_px": 12,
-          "camera_tilt_deg": 7.5,
+          "camera_tilt_deg": 0.0,
           "min_valid_frac": 0.15,
           "min_real_frac": 0.02,
           "min_real_frac_zones": 0.0,
@@ -340,8 +395,8 @@
             260
           ],
           "free_space_rows": [
-            160,
-            260
+            135,
+            235
           ],
           "center_cols": [
             260,
@@ -356,21 +411,28 @@
             580
           ],
           "ground_rows": [
-            350,
-            395
+            300,
+            345
           ],
           "ground_cols": [
             200,
             460
           ],
-          "max_ground_dist": 2.5,
+          "max_ground_dist": 1.5,
           "near_object_suppress_dist": 0.3,
           "free_space_cols": [
             60,
             580
           ],
           "free_space_bins": 9,
-          "profile_isolated_bin_margin": 0.5
+          "profile_isolated_bin_margin": 0.5,
+          "min_ground_dist": 0.42,
+          "ground_min_frac": 0.65,
+          "ground_baseline_frames": 100,
+          "clamp_warn_frames": 50,
+          "roll_offset_deg": 0.3,
+          "pitch_source": "gravity",
+          "imu_down_axis": "x"
         }
       }
     },
@@ -466,6 +528,10 @@
       [
         "platform.emergency_stop",
         "osm_router.emergency_stop"
+      ],
+      [
+        "platform.joint_angle",
+        "app.joint_angle"
       ]
     ]
   }

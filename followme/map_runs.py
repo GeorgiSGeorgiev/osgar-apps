@@ -54,6 +54,8 @@ import sys
 from osgar.logger import LogReader, lookup_stream_names
 from osgar.lib.serialize import deserialize
 
+import map_basemap
+
 
 EARTH_R = 6371000
 # distinct, colour-blind-friendly-ish track colours, cycled per run
@@ -192,9 +194,10 @@ HTML = """<!doctype html>
 <div id="map"></div>
 <script>
 const RUNS = __DATA__;
+const WAYS = __WAYS__;
+const TILE_URL = __TILE__;
 const map = L.map('map');
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-  {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+__BASEMAP__
 
 function hdopColor(h){
   if(h===null||h===undefined) return '#888';
@@ -271,6 +274,13 @@ def main():
     ap.add_argument('--max-speed', type=float, default=2.0,
                     help='implied speed (m/s) above which a fix pair is flagged as a GPS jump '
                          '(default 2.0; Matty tops out near 0.5)')
+    ap.add_argument('--map', nargs='*', default=None,
+                    help='local OSM extract(s) to draw as the basemap (default: %s)'
+                         % ', '.join(map_basemap.DEFAULT_MAPS))
+    ap.add_argument('--tile-url', default='',
+                    help='optional raster tile URL template. Empty by default: OpenStreetMap '
+                         'blocks this kind of traffic to its own servers. Only pass a service '
+                         'you are entitled to use.')
     ap.add_argument('--min-duration', type=float, default=0.0,
                     help='skip runs shorter than this many seconds')
     args = ap.parse_args()
@@ -307,8 +317,15 @@ def main():
     if not runs:
         print('nothing to draw')
         return 1
+    pts = [[f['lat'], f['lon']] for run in runs for f in run['fixes']]
+    ways, n_ways = map_basemap.ways_json(pts, args.map)
+    print('  basemap: %d local OSM ways drawn (no tile server)' % n_ways)
+
     with open(args.output, 'w', encoding='utf-8') as f:
-        f.write(HTML.replace('__DATA__', json.dumps(runs)))
+        f.write(HTML.replace('__DATA__', json.dumps(runs))
+                    .replace('__WAYS__', ways)
+                    .replace('__TILE__', json.dumps(args.tile_url))
+                    .replace('__BASEMAP__', map_basemap.BASEMAP_JS))
     print(f'\nwrote {args.output} ({len(runs)} run(s)) - open it in a browser')
     return 0
 

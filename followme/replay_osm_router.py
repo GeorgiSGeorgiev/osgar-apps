@@ -57,6 +57,8 @@ from osgar.lib.serialize import deserialize
 
 from osm_router import OSMRouter, RoadGraph, RouteState
 
+import map_basemap
+
 
 class FakeBus:
     """Same minimal stand-in view_obstacle.py uses - no threads, no queues,
@@ -211,9 +213,10 @@ HTML_TEMPLATE = """<!doctype html>
 <div id="map"></div>
 <script>
 const DATA = %s;
+const WAYS = %s;
+const TILE_URL = %s;
 const map = L.map('map').setView(DATA.route[0], 18);
-L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-  {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(map);
+__BASEMAP__
 
 L.polyline(DATA.route, {color:'#1f4fd8', weight:6, opacity:.65}).addTo(map)
   .bindPopup('planned route: ' + DATA.route_m.toFixed(0) + ' m');
@@ -266,7 +269,7 @@ legend.addTo(map);
 """
 
 
-def write_html(result, filename):
+def write_html(result, filename, map_files=None):
     """Planned route against what the robot actually did, coloured by
     cross-track. This is the view that makes an excursion obvious - a red
     arc bulging away from the blue line is the robot on the grass."""
@@ -299,8 +302,14 @@ def write_html(result, filename):
                   % (result['recovering_s'], result['lost_s'],
                      max(0, len(result['replans']) - 1), result['final_state'])),
     }
+    # basemap drawn from the same offline extract the router planned on,
+    # not from OSM's tile servers - see map_basemap
+    pts = list(data['route']) + [[p[0], p[1]] for p in track]
+    ways, n_ways = map_basemap.ways_json(pts, map_files)
     with open(filename, 'w', encoding='utf-8') as f:
-        f.write(HTML_TEMPLATE % json.dumps(data))
+        f.write((HTML_TEMPLATE % (json.dumps(data), ways, json.dumps('')))
+                .replace('__BASEMAP__', map_basemap.BASEMAP_JS))
+    print('  basemap: %d local OSM ways drawn (no tile server)' % n_ways)
     print('wrote %s' % filename)
 
 
@@ -555,7 +564,7 @@ def main():
                 print('        plan t=%.1f %-40s %.0fm' % (t, reason, total))
 
     if args.html and results:
-        write_html(results[0], args.html)
+        write_html(results[0], args.html, [args.map])
     return 0
 
 
