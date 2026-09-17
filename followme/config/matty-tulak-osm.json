@@ -41,7 +41,7 @@
           "max_backup_time_sec": 8.0,
           "max_realign_time_sec": 3.0,
           "terminate_on_stop": true,
-          "enable_ground_hazard": false,
+          "enable_ground_hazard": true,
           "ground_hazard_confirm_frames": 3,
           "terminate_on_ground_hazard": false,
           "follow_gps_target": true,
@@ -121,8 +121,8 @@
           "route_heading_gain": 0.0,
           "route_bias_max_deg": 25.0,
           "route_bias_alpha": 0.15,
-          "mask_trust_full_deg": 25.0,
-          "mask_trust_none_deg": 60.0,
+          "mask_trust_full_deg": 180.0,
+          "mask_trust_none_deg": 181.0,
           "mask_trust_min": 0.25,
           "route_min_road_frac": 0.02,
           "route_veto_authority": 0.3,
@@ -168,7 +168,7 @@
           "tube_reference_halfwidth_m": 1.2,
           "route_turn_hint_max_deg": 10.0,
           "route_turn_hint_lead_m": 12.0,
-          "route_turn_hint_full_angle_deg": 80.0,
+          "route_turn_hint_full_angle_deg": 45.0,
           "junction_hint_gain": 3.0,
           "swing_beside_only": true,
           "swing_forward_max_m": 0.05,
@@ -181,8 +181,64 @@
           "turn_clearance_margin_m": 0.5,
           "turn_clearance_comfort_m": 2.0,
           "turn_side_min_road_frac": 0.05,
-          "turn_side_road_frac_margin": 0.10,
-          "route_turn_closed_loop": true
+          "turn_side_road_frac_margin": 0.1,
+          "route_turn_closed_loop": true,
+          "ground_hazard_retreat": true,
+          "mask_center_alpha": 0.4,
+          "mask_hold_sec": 0.6,
+          "mask_largest_blob": false,
+          "mask_min_frac": 0.02,
+          "road_lost_frames": 5,
+          "road_lost_speed": 0.2,
+          "mask_aim_blend": 0.5,
+          "mask_aim_rows": [
+            0.55,
+            0.75
+          ],
+          "mask_pos_rows": [
+            0.78,
+            1.0
+          ],
+          "camera_offroad_on_frac": 0.45,
+          "camera_offroad_off_frac": 0.15,
+          "edge_grey_mode": "open",
+          "edge_grey_road_frac": 0.15,
+          "edge_lateral_max_m": 1.0,
+          "mask_bin_rows": [
+            0.5,
+            0.8
+          ],
+          "route_guidance_style": "arrow",
+          "route_bearing_authority_max": 0.0,
+          "route_turn_max_turn_deg": 165,
+          "route_turn_branch_min_frac": 0.05,
+          "route_turn_branch_full_frac": 0.2,
+          "route_turn_done_deg": 20,
+          "route_turn_timeout_m": 20,
+          "route_rate_boost": false,
+          "road_lost_retreat_sec": 1.5,
+          "road_lost_retreat_max_m": 3.0,
+          "road_found_frames": 5,
+          "road_lost_max_retreats": 2,
+          "route_turn_near_m": 3.0,
+          "heading_source": "odometry_gps",
+          "heading_offset_alpha": 0.5,
+          "heading_min_baseline_m": 4.0,
+          "heading_valid_travel_m": 60.0,
+          "route_turn_frame": "odometry",
+          "route_turn_commit_gain": 0.5,
+          "route_turn_commit_max_deg": 35.0,
+          "route_speed_gate": "camera",
+          "route_turn_slow_m": 6.0,
+          "route_offroad_camera_gate": true,
+          "route_turn_track_m": 25.0,
+          "route_turn_track_pass_m": 8.0,
+          "route_turn_approach_m": 3.0,
+          "route_turn_commit_min_deg": 90.0,
+          "route_turn_commit_window_m": 6.0,
+          "route_turn_abandon_extra_deg": 60.0,
+          "route_turn_min_rel_deg": 20.0,
+          "route_turn_align_max_deg": 60.0
         }
       },
       "osm_router": {
@@ -257,7 +313,18 @@
           "junction_min_turn_deg": 20.0,
           "offroad_lookahead_m": 1.2,
           "misaligned_turn_release_frac": 0.6,
-          "turn_exit_probe_m": 4.0
+          "turn_exit_probe_m": 4.0,
+          "heading_source": "odometry_gps",
+          "heading_offset_alpha": 0.5,
+          "heading_min_baseline_m": 4.0,
+          "heading_valid_travel_m": 60.0,
+          "recovery_turn_info": true,
+          "turn_rel_probe_m": 8.0,
+          "turn_rel_exit_probe_m": 15.0,
+          "turn_rel_cluster_m": 8.0,
+          "snap_heading_m_per_deg": 0.15,
+          "snap_heading_radius_m": 15.0,
+          "replan_heading_check_deg": 40.0
         }
       },
       "platform": {
@@ -347,12 +414,12 @@
           "depth_far_mask_max_invalid_frac": 0.85,
           "sleep_on_start_sec": 1,
           "model": {
-            "blob": "../robotem-rovne/models/robotourist-093-redroad-20260409-224x224-rgb-chw-1shave.blob"
+            "blob": "../robotem-rovne/models/redroad-v2-20260826-rdrd-s-640x480-rgb-chw-2shaves.blob"
           },
           "nn_config": {
             "output_format": "LayerFp16",
             "NN_family": "robotourist",
-            "input_size": "224x224"
+            "input_size": "640x480"
           }
         }
       },
@@ -369,14 +436,14 @@
         ],
         "init": {
           "vertical_fov_deg": 55,
-          "max_pitch_shift_deg": 20,
+          "max_pitch_shift_deg": 8,
           "pitch_shift_sign": 1,
           "pitch_offset_deg": 0.58,
           "max_pitch_error_deg": 15,
           "max_plausible_roll_deg": 30,
           "pitch_smoothing_alpha": 0.15,
           "min_shift_change_px": 12,
-          "camera_tilt_deg": 0.0,
+          "camera_tilt_deg": 7.5,
           "min_valid_frac": 0.15,
           "min_real_frac": 0.02,
           "min_real_frac_zones": 0.0,
@@ -432,7 +499,8 @@
           "clamp_warn_frames": 50,
           "roll_offset_deg": 0.3,
           "pitch_source": "gravity",
-          "imu_down_axis": "x"
+          "imu_down_axis": "x",
+          "pitch_grade_alpha": 0.02
         }
       }
     },

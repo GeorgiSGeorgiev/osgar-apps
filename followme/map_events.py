@@ -42,8 +42,11 @@
     # only the runs that actually contain something interesting
     python map_events.py "logs/.../*.log" -o events.html --only-eventful
 
-  Needs no network to build; the produced page fetches OSM tiles when you
-  open it.
+    # a different site - draw only that extract behind the track
+    python map_events.py "logs/.../*.log" -o events.html --map maps/stromovka.json
+
+  Works entirely offline, page included: the backdrop is drawn as vectors
+  from the local OSM extracts (see map_basemap.py), not fetched as tiles.
 """
 import argparse
 import map_basemap

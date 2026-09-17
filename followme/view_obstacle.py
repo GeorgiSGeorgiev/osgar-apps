@@ -50,6 +50,7 @@ from osgar.logger import LogReader, lookup_stream_names, lookup_config
 from osgar.lib.serialize import deserialize
 from osgar.exceptions import EmergencyStopException
 from osgar.obstdet3d_zones import ObstacleDetector3DZones
+from osgar.lib.nn_mask import mask_on_color
 
 from tulak_obstacle import TulakObstacle, mask_center
 
@@ -171,17 +172,20 @@ def draw_drivable_area(color_img, mask):
     image - same visualization as robotem-rovne/view_mask.py. Zeroes the
     top half before computing the centroid, mirroring tulak_obstacle's own
     on_nn_mask() sky-masking, so the crosshair drawn here matches what
-    actually drove last_dir/steering rather than a naive raw centroid."""
+    actually drove last_dir/steering rather than a naive raw centroid.
+
+    Placed through mask_on_color() rather than stretched, so the overlay
+    lands where the network actually looked - see there."""
     h_img, w_img = color_img.shape[:2]
     m = mask.copy()
     mh, mw = m.shape
     m[:mh // 2, :] = 0
 
     center_y, center_x = mask_center(m)
-    center_x = int(center_x * w_img / mw)
-    center_y = int(center_y * h_img / mh)
+    mask_resized, (scale, x0, y0) = mask_on_color(m, w_img, h_img)
+    center_x = int(center_x * scale + x0)
+    center_y = int(center_y * scale + y0)
 
-    mask_resized = cv2.resize(m, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
     colored_mask = np.zeros((h_img, w_img, 3), dtype=np.uint8)
     colored_mask[mask_resized == 1] = (0, 0, 255)
     overlay = cv2.addWeighted(color_img, 1.0, colored_mask, 0.5, 0)
@@ -277,7 +281,16 @@ def draw_free_space_bins(depth_panel, app, zones, scale):
             if abs(d * math.sin(bearing)) <= half_corridor:
                 cv2.rectangle(depth_panel, (x0, bar_top - 5), (x1, bar_top - 1), (255, 255, 255), -1)
         if d is None:
-            color = (80, 80, 80)
+            # grey = unknown. A grey bin the app has decided to IGNORE (the
+            # road network sees road in that bearing - see edge_grey_mode in
+            # tulak_obstacle) is drawn blue-grey instead, so a debug video
+            # shows the difference between "no data, still treated as a wall"
+            # and "no data, known artefact".
+            bin_road = getattr(app, 'profile_bin_road', []) or []
+            mode = getattr(app, 'edge_grey_mode', 'legacy')
+            ignored = mode == 'open' or (mode == 'mask' and i < len(bin_road)
+                                         and bin_road[i] >= app.edge_grey_road_frac)
+            color = (120, 95, 45) if ignored else (80, 80, 80)
         elif d <= free_space_min_dist:
             color = (0, 0, 140)
         else:
@@ -357,7 +370,14 @@ def build_hud_lines(dt, app, zones, reason_log, osm=None):
     # path well before the discrete maneuver; the hint is closed on heading,
     # so it should fall to zero once Matty faces the exit bearing.
     repel = math.degrees(app._corridor_repulsion()) if hasattr(app, '_corridor_repulsion') else 0.0
-    hint = math.degrees(app._route_turn_hint()) if hasattr(app, '_route_turn_hint') else 0.0
+    # read the hint the last drive cycle actually used - in 'arrow' guidance
+    # the hint method arms and releases turns, so calling it from the HUD
+    # would change what the robot does
+    sd = getattr(app, 'steer_debug', None) or {}
+    if 'hint' in sd:
+        hint = math.degrees(sd.get('hint', 0.0))
+    else:
+        hint = math.degrees(app._route_turn_hint()) if hasattr(app, '_route_turn_hint') else 0.0
     eb = getattr(app, 'route_exit_bearing', None)
     lines.append(f"steer terms: repel {repel:+5.1f}deg   turn hint {hint:+5.1f}deg"
                  f"   exit bearing {'--' if eb is None else '%.0fdeg' % (math.degrees(eb) % 360)}"
@@ -437,8 +457,24 @@ def build_hud_lines(dt, app, zones, reason_log, osm=None):
             parts.append('steer_lim=%.0fdeg' % math.degrees(app.route_steer_limit))
         if app.route_hold:
             parts.append('HOLD=%s' % app.route_hold)
+        arrow = getattr(app, '_arrow', None)
+        if arrow is not None:
+            if arrow.get('odometry'):
+                parts.append('TURN ARMED %+.0fdeg to go, est %.1fm' % (
+                    math.degrees(arrow.get('remaining', 0.0)),
+                    arrow.get('est') or 0.0))
+            else:
+                parts.append('TURN ARMED exit=%.0fdeg' % (math.degrees(arrow['exit']) % 360))
+        if getattr(app, '_road_retreat', None) is not None:
+            parts.append('ROAD-LOST RETREAT')
+        elif getattr(app, '_road_hold', False):
+            parts.append('ROAD-LOST HOLD')
         if osm is not None and osm.route is not None:
-            parts.append('next_junction=%.0fm' % osm.route.next_junction_dist(osm.s))
+            # same definition as the router's own log line and the follower's
+            # turn distance: forks the route goes straight through do not count.
+            # With every fork counted the HUD read 13.8 m while the router log
+            # said 54 m at the same instant (170349 video 6:13.97).
+            parts.append('next_turn=%.0fm' % osm.route.next_junction_dist(osm.s, osm.junction_min_turn))
         lines.append('   '.join(parts))
     else:
         lines.append("")
@@ -591,6 +627,10 @@ def read_logfile(logfile, max_depth_mm=4000, show_color=True, depth_scale=2, sta
                 img = read_video_frame(data, i_frame_only=False)
                 if img is not None:
                     color_img = img
+
+
+def normalize_turn(angle):
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
 class VideoWriter:

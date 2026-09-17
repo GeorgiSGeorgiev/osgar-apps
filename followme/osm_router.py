@@ -592,6 +592,54 @@ class Route:
             return math.atan2(dx, dy)            # x=east, y=north -> compass bearing
         return None
 
+    def next_turn_relative(self, s, min_turn_rad=0.0, probe_m=8.0, exit_probe_m=None, cluster_m=0.0):
+        """Signed angle (radians, + = left) of the same turn next_turn_signed
+        reports, measured between the chord probe_m BEFORE the node and the
+        chord probe_m AFTER it instead of the two segments touching it.
+
+        The follower measures a turn by how far its odometry heading has
+        rotated, so it needs the direction change between the road it came
+        along and the road it leaves on - not a node-spacing stub. At the
+        09-15 junction J the branch leaves at 41 deg for 7.9 m, then runs 59
+        and 84 deg; the approaches differ the same way (264 -> 239 -> 221
+        from the east). None when there is no such turn."""
+        for js in self.junction_s:
+            turn = self.junction_turn.get(js, math.pi / 2)
+            if js <= s + 0.5 or (min_turn_rad > 0 and turn < min_turn_rad):
+                continue
+            first = last = js
+            if cluster_m > 0:
+                # Turns closer together than cluster_m are ONE manoeuvre as far
+                # as the heading is concerned: measure from before the first
+                # to after the last, even if the first is already behind. The
+                # -90/+89 jog 6.3 m apart at the start of 171614 nets to ~0
+                # and is not armed at all; each node alone read -36 and +78.
+                qualifying = [q for q in self.junction_s
+                              if not (min_turn_rad > 0 and self.junction_turn.get(q, math.pi / 2) < min_turn_rad)]
+                k = qualifying.index(js)
+                while k > 0 and first - qualifying[k - 1] <= cluster_m:
+                    k -= 1
+                    first = qualifying[k]
+                k = qualifying.index(js)
+                while k + 1 < len(qualifying) and qualifying[k + 1] - last <= cluster_m:
+                    k += 1
+                    last = qualifying[k]
+            a = self.xy_at(max(0.0, first - probe_m))
+            p0 = self.xy_at(first)
+            p1 = self.xy_at(last)
+            # the exit chord may be longer: 171614 starts 1 m from a -90 deg
+            # turn followed 4 m later by a +89 deg one - a jog in the mapped
+            # footway. 8 m chords read it as -74 deg and the replay pulled
+            # right for 45 s; the direction the route actually leaves in is
+            # what the follower has to face.
+            b = self.xy_at(min(self.total, last + (exit_probe_m or probe_m)))
+            if math.hypot(p0[0] - a[0], p0[1] - a[1]) < 0.5 or math.hypot(b[0] - p1[0], b[1] - p1[1]) < 0.5:
+                return None
+            bearing_in = math.atan2(p0[0] - a[0], p0[1] - a[1])
+            bearing_out = math.atan2(b[0] - p1[0], b[1] - p1[1])
+            return -normalize_angle(bearing_out - bearing_in)
+        return None
+
     def next_junction_dist(self, s, min_turn_rad=0.0):
         """Distance from s forward to the next TURN - a junction or a sharp
         bend, see self.corner - on the route, or
@@ -795,6 +843,45 @@ class RoadGraph:
         i = k if indices is None else int(indices[k])
         return i, float(t[k]), float(dist[k]), (float(cx[k]), float(cy[k]))
 
+    def snap_consistent(self, latlon, heading, m_per_deg, radius_m):
+        """snap(), but among the ways within radius_m of the fix (or the
+        nearest, if that is further) prefer one that runs along `heading`
+        (compass radians; ways are undirected, so 180 deg off is aligned).
+        Cost = distance + m_per_deg * misalignment in degrees.
+
+        Field case 165145 (2026-09-15): Matty drove south-west (GPS course
+        217-220 deg) down a footway mapped at 244 deg while the fix wandered
+        up to ~10 m under the trees; a replan from one fix 0.2 m from a
+        footway mapped at 287/107 deg put it on that one, 10 m "before" a
+        junction it had in fact reached. That way is 67-70 deg off the
+        heading, the real one 24-27 deg: at 0.15 m/deg the real one wins
+        whenever it is less than ~6 m further away."""
+        if len(self.seg_a) == 0 or heading is None:
+            return None
+        px, py = self.to_xy(*latlon)
+        rings = int(math.ceil(radius_m / self._grid_cell)) + 1
+        idx = self._candidates(px, py, rings)
+        if idx is None:
+            return None
+        seg_a, seg_d, seg_len2 = self.seg_a[idx], self._seg_d[idx], self._seg_len2[idx]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = np.where(seg_len2 > 0,
+                          ((px - seg_a[:, 0]) * seg_d[:, 0] + (py - seg_a[:, 1]) * seg_d[:, 1])
+                          / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0)
+        t = np.clip(t, 0.0, 1.0)
+        cx = seg_a[:, 0] + t * seg_d[:, 0]
+        cy = seg_a[:, 1] + t * seg_d[:, 1]
+        dist = np.hypot(px - cx, py - cy)
+        bearing = np.arctan2(seg_d[:, 0], seg_d[:, 1])
+        misalign = np.abs((bearing - heading + np.pi / 2) % np.pi - np.pi / 2)
+        cost = dist + m_per_deg * np.degrees(misalign)
+        cost[dist > max(radius_m, float(dist.min()))] = np.inf
+        cost[seg_len2 <= 0] = np.inf
+        if not np.isfinite(cost).any():
+            return None
+        k = int(np.argmin(cost))
+        return int(idx[k]), float(t[k]), float(dist[k]), (float(cx[k]), float(cy[k]))
+
     # --- routing --------------------------------------------------
     def _overlay(self, seg_index, t, virtual_id):
         """Edges connecting a virtual node (the snapped start or goal,
@@ -814,7 +901,7 @@ class RoadGraph:
         }
 
     def plan(self, start_ll, goal_ll, start_heading=None, uturn_penalty_m=0.0,
-             blocked_edges=None):
+             blocked_edges=None, snap_heading_m_per_deg=0.0, snap_radius_m=15.0):
         """A* from the point on the map nearest `start_ll` to the point
         nearest `goal_ll`. `start_heading` is a compass bearing (radians,
         0=north, clockwise) used only to bias the very first step away
@@ -828,6 +915,10 @@ class RoadGraph:
         path exists."""
         blocked_edges = blocked_edges or set()
         start_snap = self.snap(*start_ll)
+        if start_heading is not None and snap_heading_m_per_deg > 0:
+            # see snap_consistent - the start is where a wrong branch costs most
+            start_snap = self.snap_consistent(start_ll, start_heading, snap_heading_m_per_deg,
+                                              snap_radius_m) or start_snap
         goal_snap = self.snap(*goal_ll)
         if start_snap is None or goal_snap is None:
             return None
@@ -1024,6 +1115,39 @@ class OSMRouter(Node):
         # how far past a turn node the exit bearing is measured - see
         # Route.next_turn_exit_bearing
         self.turn_exit_probe_m = config.get('turn_exit_probe_m', 4.0)
+        # chord length either side of a turn node for turn_rel_deg - see
+        # Route.next_turn_relative. Published always (a new key; older
+        # followers ignore it).
+        self.turn_rel_probe_m = config.get('turn_rel_probe_m', 8.0)
+        self.turn_rel_exit_probe_m = config.get('turn_rel_exit_probe_m', None)
+        self.turn_rel_cluster_m = config.get('turn_rel_cluster_m', 0.0)
+        # Keep publishing the next turn while RECOVERING. It was withheld, so
+        # a turn inside a recovery episode was never announced: 170349
+        # entered recovery 16.9 m before a 136 deg left hairpin (GPS 6-7 m
+        # east of a road the camera was driving down) and the router counted
+        # the junction as passed at t=375.7 without the follower ever arming
+        # it. False = previous behaviour.
+        self.recovery_turn_info = config.get('recovery_turn_info', False)
+        # Heading source for the U-turn bias, the misalignment latch, the
+        # heading-consistent snap and the replan check: 'compass' (previous)
+        # or 'odometry_gps' - see heading_estimator.py.
+        self.heading_source = config.get('heading_source', 'compass')
+        self.heading_est = None
+        if self.heading_source == 'odometry_gps':
+            from heading_estimator import OdoGpsHeading
+            self.heading_est = OdoGpsHeading(alpha=config.get('heading_offset_alpha', 0.5),
+                                             min_baseline_m=config.get('heading_min_baseline_m', 4.0),
+                                             valid_travel_m=config.get('heading_valid_travel_m', 60.0))
+        # Plan start on the way that runs along the heading, not merely the
+        # nearest - see RoadGraph.snap_consistent. 0 = nearest (previous).
+        self.snap_heading_m_per_deg = config.get('snap_heading_m_per_deg', 0.0)
+        self.snap_heading_radius_m = config.get('snap_heading_radius_m', 15.0)
+        # "drifted onto another mapped path" re-plans only when the nearest
+        # way runs within this many degrees of the heading AND the planned
+        # route here does not. 0 = previous behaviour (any fix near another
+        # way, for corridor_hard_confirm_sec). See _drift_replan_consistent.
+        self.replan_heading_check_deg = config.get('replan_heading_check_deg', 0.0)
+        self._drift_note_time = None
         self._misaligned_latched = False
 
         # --- how much the follower should trust the route bearing ---
@@ -1272,6 +1396,8 @@ class OSMRouter(Node):
         does. Returns None without a calibration offset, in which case the
         planner simply skips the U-turn bias rather than applying a
         possibly-mirrored one."""
+        if self.heading_est is not None:
+            return self.heading_est.heading()      # heading_source 'odometry_gps'
         if not self.have_heading or self.compass_offset is None:
             return None
         heading = normalize_angle(math.pi / 2 - self.compass_sign * self.last_heading
@@ -1376,6 +1502,8 @@ class OSMRouter(Node):
         was_lost = self.state == RouteState.GPS_LOST
         self.last_fix = (lat, lon)
         self.last_fix_time = self.time
+        if self.heading_est is not None and self.time is not None:
+            self.heading_est.update_fix(self.time.total_seconds(), lat, lon)
         self._select_map(self.last_fix)
         if was_lost:
             print(self.time, 'ROUTE: GPS back at %.6f,%.6f - re-planning to the kept target'
@@ -1395,6 +1523,8 @@ class OSMRouter(Node):
     def on_pose2d(self, data):
         x_mm, y_mm, heading_cdeg = data
         pose = (x_mm / 1000.0, y_mm / 1000.0, math.radians(heading_cdeg / 100.0))
+        if self.heading_est is not None and self.time is not None:
+            self.heading_est.update_pose(self.time.total_seconds(), *pose)
         if self.route is not None and self._prev_pose is not None:
             dx = pose[0] - self._prev_pose[0]
             dy = pose[1] - self._prev_pose[1]
@@ -1484,7 +1614,9 @@ class OSMRouter(Node):
         route = self.graph.plan(self.last_fix, self.goal_ll,
                                  start_heading=self._compass_bearing(),
                                  uturn_penalty_m=self.uturn_penalty_m,
-                                 blocked_edges=self.blocked_edges)
+                                 blocked_edges=self.blocked_edges,
+                                 snap_heading_m_per_deg=self.snap_heading_m_per_deg,
+                                 snap_radius_m=self.snap_heading_radius_m)
         self._pending_plan_reason = None
         self._last_replan_time = self.time
         if route is None:
@@ -1625,7 +1757,8 @@ class OSMRouter(Node):
                 if dist_any_way < self.corridor_soft_m:
                     # on a different real path - the avoidance maneuvers
                     # moved us, the map is still fine, just re-route
-                    if self._request_replan('drifted onto another mapped path'):
+                    if (self._drift_replan_consistent(snap)
+                            and self._request_replan('drifted onto another mapped path')):
                         return
                 if self.state != RouteState.RECOVERING:
                     print(self.time, 'ROUTE: off the planned corridor (%.1fm, nearest mapped way '
@@ -1641,7 +1774,10 @@ class OSMRouter(Node):
 
         if (self.state == RouteState.RECOVERING and self._recovering_since is not None
                 and self.time - self._recovering_since > self.recovery_replan_after):
-            if not self._request_replan('recovery took too long'):
+            if not self._recovery_replan_consistent():
+                # heading follows the planned road: a GPS offset, not an excursion
+                self._recovering_since = self.time
+            elif not self._request_replan('recovery took too long'):
                 self._recovering_since = self.time  # cooldown/limit - wait and keep steering back
 
         self._check_stall()
@@ -1793,6 +1929,72 @@ class OSMRouter(Node):
         span = max(1e-6, self.gps_lost_sec - self.gps_dead_reckon_sec)
         return max(0.0, min(1.0, (age - self.gps_dead_reckon_sec) / span))
 
+    def _turn_rel_deg(self):
+        rel = self.route.next_turn_relative(self.s, self.junction_min_turn, self.turn_rel_probe_m,
+                                            self.turn_rel_exit_probe_m, self.turn_rel_cluster_m)
+        return None if rel is None else round(math.degrees(rel), 1)
+
+    def _turn_info(self, to_junction):
+        """The next-turn keys _guidance publishes, for states that do not
+        run the rest of it - see recovery_turn_info."""
+        turn_signed = self.route.next_turn_signed(self.s, self.junction_min_turn)
+        exit_bearing = self.route.next_turn_exit_bearing(self.s, self.junction_min_turn,
+                                                         self.turn_exit_probe_m)
+        return {
+            'turn_dir_deg': None if turn_signed is None else round(math.degrees(turn_signed), 1),
+            'turn_dist_m': round(to_junction, 1),
+            'exit_bearing_deg': None if exit_bearing is None else round(math.degrees(exit_bearing) % 360.0, 1),
+            'turn_rel_deg': self._turn_rel_deg(),
+        }
+
+    def _recovery_replan_consistent(self):
+        """Whether a "recovery took too long" re-plan is warranted. Not while
+        the heading runs along the planned road here (within
+        replan_heading_check_deg): the robot is on it and the fix is off. A
+        re-plan starts from the nearest way to that fix - 165145 t=45 and all
+        five re-plans in 170349 started 5-8 m off-path. No heading = previous
+        behaviour (re-plan)."""
+        if self.replan_heading_check_deg <= 0:
+            return True
+        heading = self._compass_bearing()
+        if heading is None:
+            return True
+        tx, ty = self.route.tangent_at(self.s)
+        off = abs((math.atan2(tx, ty) - heading + math.pi / 2) % math.pi - math.pi / 2)
+        if off > math.radians(self.replan_heading_check_deg):
+            return True
+        if self._drift_note_time is None or (self.time - self._drift_note_time).total_seconds() > 10.0:
+            self._drift_note_time = self.time
+            print(self.time, 'ROUTE: off the corridor by GPS but heading follows the planned road '
+                              '(%.0f deg) - not re-planning' % math.degrees(off))
+        return False
+
+    def _drift_replan_consistent(self, snap):
+        """Whether a "drifted onto another mapped path" re-plan is backed by
+        the heading: the nearest way runs along it and the planned route
+        here does not. One fix near another way is not enough - under trees
+        the fix wanders 5-10 m and the planned way is usually still right
+        (165145). See replan_heading_check_deg."""
+        if self.replan_heading_check_deg <= 0 or snap is None:
+            return True
+        heading = self._compass_bearing()
+        limit = math.radians(self.replan_heading_check_deg)
+        off = lambda bearing: abs((bearing - heading + math.pi / 2) % math.pi - math.pi / 2)  # noqa: E731
+        if heading is None:
+            ok, why = False, 'no trustworthy heading yet'
+        else:
+            d = self.graph._seg_d[snap[0]]
+            tx, ty = self.route.tangent_at(self.s)
+            way_off, route_off = off(math.atan2(d[0], d[1])), off(math.atan2(tx, ty))
+            ok = way_off <= limit and route_off > limit
+            why = 'nearest way %.0f deg off the heading, planned route %.0f deg' % (
+                math.degrees(way_off), math.degrees(route_off))
+        if not ok and (self._drift_note_time is None
+                       or (self.time - self._drift_note_time).total_seconds() > 10.0):
+            self._drift_note_time = self.time
+            print(self.time, 'ROUTE: near another mapped way but not re-planning onto it (%s)' % why)
+        return ok
+
     def _guidance(self):
         """Everything the follower needs to know about HOW to use this aim
         point, not just where it is. Three situations that want genuinely
@@ -1820,14 +2022,18 @@ class OSMRouter(Node):
 
         Returns a dict merged into the published hint."""
         if self.state == RouteState.RECOVERING:
-            return {
+            hint = {}
+            if self.recovery_turn_info:
+                hint = self._turn_info(self.route.next_junction_dist(self.s, self.junction_min_turn))
+            hint.update({
                 'mode': 'recovery',
                 'authority': self.recovery_authority,
                 'lookahead_m': self.recovery_lookahead_m,
                 'steer_limit_deg': self.recovery_steer_limit_deg,
                 'steer_rate_deg_s': self.junction_steer_rate_deg_s,
                 'speed_limit': self.recovery_speed_limit,
-            }
+            })
+            return hint
 
         approach, to_junction = self._junction_approach()
         lerp = lambda a, b: a + approach * (b - a)  # noqa: E731 - three uses, all identical
@@ -1940,6 +2146,8 @@ class OSMRouter(Node):
             'exit_bearing_deg': None if exit_bearing is None
                                 else round(math.degrees(exit_bearing) % 360.0, 1),
         }
+
+        hint['turn_rel_deg'] = self._turn_rel_deg()
 
         # Speed at a turn scaled by how sharp it is, not a flat cap. With
         # corners counted as turns (which they must be - see Route), dense

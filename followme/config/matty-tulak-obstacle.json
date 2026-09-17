@@ -216,12 +216,12 @@
           "depth_far_mask_max_invalid_frac": 0.85,
           "sleep_on_start_sec": 1,
           "model": {
-            "blob": "../robotem-rovne/models/robotourist-093-redroad-20260409-224x224-rgb-chw-1shave.blob"
+            "blob": "../robotem-rovne/models/redroad-v2-20260826-rdrd-s-640x480-rgb-chw-2shaves.blob"
           },
           "nn_config": {
             "output_format": "LayerFp16",
             "NN_family": "robotourist",
-            "input_size": "224x224"
+            "input_size": "640x480"
           }
         }
       },

@@ -12,6 +12,7 @@ import numpy as np
 
 from osgar.logger import LogReader, lookup_stream_id
 from osgar.lib.serialize import deserialize
+from osgar.lib.nn_mask import mask_on_color
 
 from main import mask_center
 from log_info import get_time_and_dist
@@ -66,15 +67,19 @@ def read_logfile(logfile, writer=None, add_time=True, threshold=None, downscale=
                 mask = deserialize(data)
                 if threshold is not None:
                     mask = (mask > threshold).astype(np.uint8)
-                assert mask.shape in [(120, 160), (112,112)], mask.shape
+                assert mask.shape in [(120, 160), (112,112), (240, 320)], mask.shape
                 orig_height, orig_width = mask.shape
 #                mask[:height//2, :] = 0  # remove sky detections
                 center_y, center_x = mask_center(mask)
-                mask = cv2.resize(mask, (1920//downscale, 1080//downscale))
+                # the mask and the colour frame are different CROPS of the
+                # same 4:3 sensor, so the mask has to be placed, not
+                # stretched - 640x480 sees above and below the 16:9 frame,
+                # the older 224x224 saw less of it left and right
+                mask, (scale, off_x, off_y) = mask_on_color(
+                        mask, 1920 // downscale, 1080 // downscale)
                 height, width = mask.shape
-                scale = width // orig_width  # 160 -> 640 -> 1920
-                center_x *= scale
-                center_y *= height // orig_height
+                center_x = int(center_x * scale + off_x)
+                center_y = int(center_y * scale + off_y)
                 colored_mask = np.zeros((height, width, 3), dtype=np.uint8)
                 colored_mask[mask == 1] = [0, 0, 255]
                 overlay = cv2.addWeighted(img, 1, colored_mask, 0.7, 0)
