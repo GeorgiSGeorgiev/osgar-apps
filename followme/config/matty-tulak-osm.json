@@ -238,7 +238,22 @@
           "route_turn_commit_window_m": 6.0,
           "route_turn_abandon_extra_deg": 60.0,
           "route_turn_min_rel_deg": 20.0,
-          "route_turn_align_max_deg": 60.0
+          "route_turn_align_max_deg": 120.0,
+          "route_turn_done_frac": 0.25,
+          "route_turn_done_min_deg": 8.0,
+          "route_turn_blind_deg": 18.0,
+          "route_turn_blind_window_m": 3.0,
+          "route_turn_blind_min_ahead": 0.6,
+          "replan_on_missed_turn": true,
+          "route_turn_missed_frac": 0.5,
+          "avoid_road_side_veto": true,
+          "road_scout_m": 2.0,
+          "road_scout_speed": 0.15,
+          "road_scout_max_deg": 35.0,
+          "road_scout_tries": 1,
+          "road_scout_min_frac": 0.3,
+          "road_scout_on_road_m": 2.5,
+          "road_scout_clear_m": 1.5
         }
       },
       "osm_router": {
@@ -268,8 +283,8 @@
           "cruise_authority": 0.45,
           "junction_authority": 0.85,
           "recovery_authority": 0.9,
-          "corridor_soft_m": 1.5,
-          "corridor_hard_m": 4.0,
+          "corridor_soft_m": 2.5,
+          "corridor_hard_m": 6.0,
           "corridor_hard_confirm_sec": 2.0,
           "lost_dist_m": 25.0,
           "lost_confirm_sec": 10.0,
@@ -324,7 +339,12 @@
           "turn_rel_cluster_m": 8.0,
           "snap_heading_m_per_deg": 0.15,
           "snap_heading_radius_m": 15.0,
-          "replan_heading_check_deg": 40.0
+          "replan_heading_check_deg": 40.0,
+          "replan_on_missed_turn": true,
+          "enforce_boundary": false,
+          "boundary_osm": "maps/robotour2026-ver1.osm",
+          "boundary_min_ways": 5,
+          "replan_max_snap_m": 8.0
         }
       },
       "platform": {
@@ -600,6 +620,10 @@
       [
         "platform.joint_angle",
         "app.joint_angle"
+      ],
+      [
+        "app.missed_turn",
+        "osm_router.missed_turn"
       ]
     ]
   }

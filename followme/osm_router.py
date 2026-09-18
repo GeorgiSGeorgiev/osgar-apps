@@ -259,6 +259,7 @@ import math
 import os
 
 import numpy as np
+import xml.etree.ElementTree as ET
 
 from osgar.node import Node
 
@@ -685,7 +686,8 @@ class RoadGraph:
 
     def __init__(self, map_data, allowed=None, highway_penalty=None, surface_penalty=None,
                  default_highway_penalty=1.5, default_surface_penalty=1.2,
-                 corner_angle_deg=35.0, highway_halfwidth=None, default_halfwidth=DEFAULT_HALFWIDTH_M):
+                 corner_angle_deg=35.0, highway_halfwidth=None, default_halfwidth=DEFAULT_HALFWIDTH_M,
+                 allowed_way_ids=None):
         # bend sharp enough to be treated as a turn - see Route.__init__
         self.corner_angle_rad = math.radians(corner_angle_deg)
         allowed = set(allowed or DEFAULT_ALLOWED_HIGHWAY)
@@ -707,6 +709,8 @@ class RoadGraph:
         self.adj = {}
         seg_a, seg_b, seg_pen, seg_nodes, seg_half = [], [], [], [], []
         self.skipped_ways = 0
+        self.kept_ways = 0
+        self.outside_boundary_ways = 0
         halfwidth_by_highway = dict(DEFAULT_HIGHWAY_HALFWIDTH)
         halfwidth_by_highway.update(highway_halfwidth or {})
 
@@ -716,6 +720,12 @@ class RoadGraph:
             if penalty is None:
                 self.skipped_ways += 1
                 continue
+            if allowed_way_ids is not None and str(way.get('id')) not in allowed_way_ids:
+                # outside the competition area - see load_boundary_ways
+                self.skipped_ways += 1
+                self.outside_boundary_ways += 1
+                continue
+            self.kept_ways += 1
             # how wide this way's surface is, for the off-road test - see
             # DEFAULT_HIGHWAY_HALFWIDTH. An explicit width tag wins where
             # it exists; anything unparseable falls through to the type.
@@ -1037,6 +1047,38 @@ START_WORDS = ('start', 'go')
 STOP_WORDS = ('stop', 'abort', 'cancel')
 
 
+def load_boundary_ways(path):
+    """OSM way ids inside the competition area, from a JOSM-edited .osm file.
+
+    The organisers' file (documents/robotour2026-ver1.osm) is an extract with
+    everything OUTSIDE the area marked action='delete': 2272 of 2488 nodes and
+    142 of 195 ways. What survives is the area, so the allowed set is every
+    surviving way that carries a highway tag - 38 of them, spanning
+    50.1035..50.1067 N, 14.4193..14.4300 E (355 x 747 m), of which 37 are also
+    in maps/stromovka.json.
+
+    Ids, not a polygon: the ids are OSM's own and match the map extract
+    exactly, so there is no edge case about a way that crosses the border or a
+    node that sits on it."""
+    root = ET.parse(path).getroot()
+    nodes = {n.get('id'): (float(n.get('lat')), float(n.get('lon')))
+             for n in root.findall('node') if n.get('lat')}
+    ids, lats, lons = set(), [], []
+    for way in root.findall('way'):
+        if way.get('action') == 'delete':
+            continue
+        if not any(tag.get('k') == 'highway' for tag in way.findall('tag')):
+            continue
+        ids.add(str(way.get('id')))
+        for nd in way.findall('nd'):
+            point = nodes.get(nd.get('ref'))
+            if point:
+                lats.append(point[0])
+                lons.append(point[1])
+    bbox = (min(lats), max(lats), min(lons), max(lons)) if lats else (-90.0, 90.0, -180.0, 180.0)
+    return ids, bbox
+
+
 def _find_map_file(path):
     """Config paths are written relative to wherever osgar happens to be
     launched from, which is not always the app directory. Try the obvious
@@ -1064,6 +1106,32 @@ class OSMRouter(Node):
         # remove: on 2026-09-04 Matty ran at CZU with the Stromovka map
         # loaded, and every symptom pointed at the QR code or the GPS
         # rather than at the one config line that was wrong.
+        # Competition area (item 9): only ways inside it may be planned on.
+        # False keeps the whole map routable.
+        self.enforce_boundary = config.get('enforce_boundary', False)
+        self.boundary_min_ways = config.get('boundary_min_ways', 5)
+        # how far outside the area's own bbox still counts as inside, so a
+        # start a few metres beyond the edge does not fall back to the whole map
+        self.boundary_margin_m = config.get('boundary_margin_m', 25.0)
+        # A re-plan starts at the nearest way to the CURRENT fix, so a fix far
+        # from any way produces a route from somewhere the robot has never
+        # been. Near the building at 170734 the fix sat 10-13 m off and the
+        # router re-planned seven times, each from a different wrong place,
+        # while the camera was driving down a cobbled square. Above this
+        # distance a re-plan waits for a better fix; the first plan of a run
+        # is never blocked. 0 = previous behaviour.
+        self.replan_max_snap_m = config.get('replan_max_snap_m', 0.0)
+        self._snap_note_time = None
+        self.boundary_ids = None
+        self.boundary_bbox = None
+        self._inside_boundary = None
+        boundary = config.get('boundary_osm')
+        if boundary and self.enforce_boundary:
+            boundary_path = _find_map_file(boundary)
+            self.boundary_ids, self.boundary_bbox = load_boundary_ways(boundary_path)
+            print('competition area %s: %d allowed ways, lat %.4f..%.4f lon %.4f..%.4f'
+                   % ((boundary_path, len(self.boundary_ids)) + self.boundary_bbox))
+
         map_files = config['map_file']
         if isinstance(map_files, str):
             map_files = [map_files]
@@ -1148,6 +1216,11 @@ class OSMRouter(Node):
         # way, for corridor_hard_confirm_sec). See _drift_replan_consistent.
         self.replan_heading_check_deg = config.get('replan_heading_check_deg', 0.0)
         self._drift_note_time = None
+        # Re-plan when the follower says it missed a turn (app.missed_turn).
+        # The alternative to a U-turn: the planner is asked for another way
+        # round from where the robot actually is, and its uturn_penalty_m
+        # still discourages turning back on the spot.
+        self.replan_on_missed_turn = config.get('replan_on_missed_turn', False)
         self._misaligned_latched = False
 
         # --- how much the follower should trust the route bearing ---
@@ -1305,16 +1378,20 @@ class OSMRouter(Node):
         map_file = _find_map_file(entry)
         with open(map_file, encoding='utf-8') as f:
             map_data = json.load(f)
-        graph = RoadGraph(
-            map_data,
-            allowed=config.get('allowed_highway'),
-            highway_penalty=config.get('highway_penalty'),
-            surface_penalty=config.get('surface_penalty'),
-            default_highway_penalty=config.get('default_highway_penalty', 1.5),
-            default_surface_penalty=config.get('default_surface_penalty', 1.2),
-            corner_angle_deg=config.get('corner_angle_deg', 35.0),
-            highway_halfwidth=config.get('highway_halfwidth'),
-            default_halfwidth=config.get('default_halfwidth_m', DEFAULT_HALFWIDTH_M))
+        graph = self._build_graph(map_data, config, None)
+        area_graph = None
+        if self.boundary_ids is not None:
+            area_graph = self._build_graph(map_data, config, self.boundary_ids)
+        if area_graph is not None and area_graph.kept_ways < self.boundary_min_ways:
+            # this map and that boundary file describe different places -
+            # routing on %d ways would strand the robot, so say so loudly and
+            # use the whole map instead
+            print('WARNING: only %d ways of %s are inside the competition area - that area is elsewhere, '
+                   'planning on the whole map' % (area_graph.kept_ways, map_file))
+            area_graph = None
+        elif area_graph is not None:
+            print('competition area available for %s: %d ways inside, %d outside - used while the robot is '
+                   'inside the area' % (map_file, area_graph.kept_ways, area_graph.outside_boundary_ways))
         bbox = map_data.get('bbox')
         # The area is printed at boot on purpose: running the wrong map for
         # the site is silent everywhere else, and its symptom (see
@@ -1324,10 +1401,25 @@ class OSMRouter(Node):
                % (map_file, len(graph.node_xy), len(graph.seg_nodes), graph.skipped_ways,
                   'unknown' if not bbox else
                   'lat %.4f..%.4f lon %.4f..%.4f' % (bbox[0], bbox[2], bbox[1], bbox[3])))
-        return {'path': map_file, 'bbox': bbox, 'graph': graph}
+        return {'path': map_file, 'bbox': bbox, 'graph': graph, 'area_graph': area_graph}
+
+    def _build_graph(self, map_data, config, allowed_way_ids):
+        return RoadGraph(
+            map_data,
+            allowed=config.get('allowed_highway'),
+            highway_penalty=config.get('highway_penalty'),
+            surface_penalty=config.get('surface_penalty'),
+            default_highway_penalty=config.get('default_highway_penalty', 1.5),
+            default_surface_penalty=config.get('default_surface_penalty', 1.2),
+            corner_angle_deg=config.get('corner_angle_deg', 35.0),
+            highway_halfwidth=config.get('highway_halfwidth'),
+            default_halfwidth=config.get('default_halfwidth_m', DEFAULT_HALFWIDTH_M),
+            allowed_way_ids=allowed_way_ids)
 
     def _use_map(self, entry):
+        self._map_entry = entry
         self.graph = entry['graph']
+        self._inside_boundary = None
         self.map_bbox = entry['bbox']
         self.map_path = entry['path']
 
@@ -1349,6 +1441,25 @@ class OSMRouter(Node):
         m_per_deg_lon = METERS_PER_DEG_LAT * math.cos(math.radians(lat))
         return min((lat - south) * METERS_PER_DEG_LAT, (north - lat) * METERS_PER_DEG_LAT,
                    (lon - west) * m_per_deg_lon, (east - lon) * m_per_deg_lon)
+
+    def _apply_boundary(self, lat, lon):
+        """Route only inside the competition area while the robot is in it -
+        see enforce_boundary. Outside it (a test drive somewhere else) the
+        whole map stays routable, so the area file cannot strand the robot at
+        another site."""
+        entry = getattr(self, '_map_entry', None)
+        if entry is None or entry.get('area_graph') is None or self.boundary_bbox is None:
+            return
+        south, north, west, east = self.boundary_bbox
+        margin = self.boundary_margin_m / METERS_PER_DEG_LAT
+        inside = (south - margin <= lat <= north + margin
+                  and west - margin * 1.6 <= lon <= east + margin * 1.6)
+        if inside == self._inside_boundary:
+            return
+        self._inside_boundary = inside
+        self.graph = entry['area_graph'] if inside else entry['graph']
+        print(self.time, 'ROUTE: %s the competition area - planning on %d segments'
+               % ('inside' if inside else 'outside', len(self.graph.seg_nodes)))
 
     def _select_map(self, latlon):
         """Pick the loaded map that actually covers where the robot is,
@@ -1386,6 +1497,17 @@ class OSMRouter(Node):
                   snap_distance(best)))
 
     # --- inputs ---------------------------------------------------
+    def on_missed_turn(self, data):
+        """The follower armed a turn, counted it down and never drove it -
+        see replan_on_missed_turn. Plan another way round from here rather
+        than leave the robot going the wrong way down the route."""
+        if not self.replan_on_missed_turn or self.route is None:
+            return
+        if self.state not in (RouteState.FOLLOWING, RouteState.RECOVERING):
+            return
+        self._request_replan('the follower missed a turn (%s deg of %s)'
+                              % (data.get('remaining_deg'), data.get('turn_deg')))
+
     def on_rotation(self, data):
         self.last_heading = math.radians(data[0] / 100.0)
         self.have_heading = True
@@ -1502,6 +1624,7 @@ class OSMRouter(Node):
         was_lost = self.state == RouteState.GPS_LOST
         self.last_fix = (lat, lon)
         self.last_fix_time = self.time
+        self._apply_boundary(lat, lon)
         if self.heading_est is not None and self.time is not None:
             self.heading_est.update_fix(self.time.total_seconds(), lat, lon)
         self._select_map(self.last_fix)
@@ -1667,10 +1790,27 @@ class OSMRouter(Node):
             'points': [[round(la, 7), round(lo, 7)] for la, lo in route.points_ll],
         })
 
+    def _replan_position_ok(self):
+        """Whether the current fix is close enough to the network for a
+        re-plan to start somewhere real - see replan_max_snap_m."""
+        if self.replan_max_snap_m <= 0 or self.route is None or self.last_fix is None:
+            return True
+        snap = self.graph.snap(*self.last_fix)
+        if snap is None or snap[2] <= self.replan_max_snap_m:
+            return True
+        if (self._snap_note_time is None
+                or (self.time - self._snap_note_time).total_seconds() > 15.0):
+            self._snap_note_time = self.time
+            print(self.time, 'ROUTE: not re-planning - the fix is %.0fm from any mapped way, a new route would '
+                              'start somewhere the robot has never been' % snap[2])
+        return False
+
     def _request_replan(self, reason):
         if self.replans >= self.max_replans:
             return False
         if self._last_replan_time is not None and self.time - self._last_replan_time < self.replan_cooldown:
+            return False
+        if not self._replan_position_ok():
             return False
         self.replans += 1
         print(self.time, 'ROUTE: re-planning (%s), attempt %d/%d' % (reason, self.replans, self.max_replans))

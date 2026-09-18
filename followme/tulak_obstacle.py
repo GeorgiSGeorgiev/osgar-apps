@@ -1374,7 +1374,7 @@ class TulakObstacle(Node):
         # a config key nothing reads means the config is newer than this
         # file - see _ReadTrackingConfig and the check at the end of __init__
         config = _ReadTrackingConfig(config)
-        bus.register('desired_steering')
+        bus.register('desired_steering', 'missed_turn')
 
         # driving
         self.max_speed = config.get('max_speed', 0.5)
@@ -2366,6 +2366,57 @@ class TulakObstacle(Node):
         # 349 deg); the turn armed from the exit bearing anyway and pulled
         # -25 deg for 20 s toward a branch that was behind it. 0 disables.
         self.route_turn_align_max = math.radians(config.get('route_turn_align_max_deg', 0.0))
+        # How much of the turn still counts as "facing the exit". The
+        # tolerance is the SMALLER of route_turn_done_deg and this fraction
+        # of the turn, floored at route_turn_done_min_deg. At 0.5 a 38 deg
+        # turn was released with 19 deg still to do - half of it - and the
+        # road follower took over pointing between the two branches
+        # (161958 t=30.9, and all six turns of the 173022 run).
+        self.route_turn_done_frac = config.get('route_turn_done_frac', 0.5)
+        self.route_turn_done_min = math.radians(config.get('route_turn_done_min_deg', 0.0))
+        # Turning where the camera sees no branch at all. The mud track at
+        # 163151 never rose above 0.16 road fraction in the far band on the
+        # turn side, so the branch pull stayed under 5 deg and Matty drove
+        # past a turn it had correctly armed and counted down. This steers by
+        # the map alone, but only inside the window below, only while the
+        # camera still sees road where Matty IS, and only as far as this
+        # angle. 0 disables.
+        self.route_turn_blind = math.radians(config.get('route_turn_blind_deg', 0.0))
+        self.route_turn_blind_window_m = config.get('route_turn_blind_window_m', 3.0)
+        # ...and only while the camera sees at least this much road straight
+        # ahead, i.e. the robot is demonstrably still ON a road when it starts
+        # the turn. Defaults to the off-road threshold.
+        self.route_turn_blind_min_ahead = config.get('route_turn_blind_min_ahead',
+                                                     config.get('camera_offroad_on_frac', 0.45))
+        # A turn abandoned with more than this fraction of it still to do is
+        # reported to the router (missed_turn) so it can plan another way
+        # round. Needs the app.missed_turn -> osm_router.missed_turn link.
+        self.replan_on_missed_turn = config.get('replan_on_missed_turn', False)
+        self.route_turn_missed_frac = config.get('route_turn_missed_frac', 0.5)
+        # Never turn INTO the side the mask says is not road when the other
+        # side is road - back up instead, or go round on the road side if the
+        # depth profile shows room past the obstacle. The red tram-stop post
+        # at 161958 t=100 read left 2.15 m (grass) and right 0.68 m (the
+        # post): depth alone chose the grass, while the mask had 0.97 road on
+        # the right and 0.00 on the left.
+        self.avoid_road_side_veto = config.get('avoid_road_side_veto', False)
+        self._forced_turn_sign = None
+        # Scouting after the road-lost retreats are spent: creep toward the
+        # last direction the camera saw road in, instead of holding on the
+        # spot until a human moves the robot (161321 t=201, 165432 t=305).
+        # 0 disables and keeps the hold.
+        self.road_scout_m = config.get('road_scout_m', 0.0)
+        self.road_scout_speed = config.get('road_scout_speed', 0.15)
+        self.road_scout_max = math.radians(config.get('road_scout_max_deg', 35.0))
+        self.road_scout_tries = config.get('road_scout_tries', 1)
+        self.road_scout_min_frac = config.get('road_scout_min_frac', 0.3)
+        # only scout where the map agrees the robot is still on a road, and
+        # only with the depth clear this far ahead
+        self.road_scout_on_road_m = config.get('road_scout_on_road_m', 1.0)
+        self.road_scout_clear_m = config.get('road_scout_clear_m', 1.5)
+        self._road_scout = None
+        self._road_scouts = 0
+        self._road_last_dir = 0.0
         self._turn_track = None
         self._turn_done_keys = set()
         self._turn_done_seq = None
@@ -3913,6 +3964,10 @@ class TulakObstacle(Node):
         r0, r1 = int(height * 0.70), int(height * 0.85)
         c0, c1 = int(width * 0.40), int(width * 0.60)
         self.road_ahead_frac = float(mask[r0:r1, c0:c1].mean())
+        if self.road_ahead_frac >= self.road_scout_min_frac:
+            # the steering that pointed at the road while it was still
+            # visible - where a road-lost scout goes looking (road_scout_m)
+            self._road_last_dir = self.last_dir
 
         # road fraction inside each depth bin's bearing band, for judging grey
         # bins (see edge_grey_mode) - mapped through the same pinhole geometry
@@ -4023,6 +4078,12 @@ class TulakObstacle(Node):
         left = self.left_dist if self.left_dist is not None else float('inf')
         right = self.right_dist if self.right_dist is not None else float('inf')
 
+        if self._forced_turn_sign is not None:
+            # the caller already decided (see _only_clear_side_is_grass)
+            pick, self._forced_turn_sign = self._forced_turn_sign, None
+            self._turn_sign_committed = True
+            self.last_turn_sign_choice = pick
+            return pick
         if self._turn_sign_committed:
             current_side = left if self.turn_sign > 0 else right
             other_side = right if self.turn_sign > 0 else left
@@ -4119,6 +4180,39 @@ class TulakObstacle(Node):
             pick = -pick
             self.last_turn_sign_choice = pick
         return pick
+
+    def _only_clear_side_is_grass(self):
+        """True when depth calls exactly one side passable and the mask says
+        that side is not road while the other one is - see
+        avoid_road_side_veto in __init__. Returns (True, road_side) or
+        (False, 0)."""
+        if not self.avoid_road_side_veto or self.turn_side_min_road_frac <= 0:
+            return False, 0
+        left = self.left_dist if self.left_dist is not None else float('inf')
+        right = self.right_dist if self.right_dist is not None else float('inf')
+        left_clear = left > self.turning_dist
+        right_clear = right > self.turning_dist
+        if left_clear == right_clear:
+            return False, 0                 # both or neither - the usual logic decides
+        clear_frac = self.left_road_frac if left_clear else self.right_road_frac
+        other_frac = self.right_road_frac if left_clear else self.left_road_frac
+        if (clear_frac < self.turn_side_min_road_frac
+                and other_frac > clear_frac + self.turn_side_road_frac_margin):
+            return True, (-1 if left_clear else 1)
+        return False, 0
+
+    def _road_side_has_gap(self, side):
+        """Room past the obstacle on that side: an outermost depth bin that
+        reads far, or reads nothing at all. A bin with no return is open
+        ground as far as this is concerned - same reading as
+        edge_grey_mode 'open', and it is what a thin post looks like from
+        the side (161958: bins at +23 and +31 deg empty while the post sat
+        at +15 deg, 1.2 m)."""
+        profile = self.depth_profile or []
+        if len(profile) < 3:
+            return False
+        edge = profile[-2:] if side < 0 else profile[:2]
+        return any(d is None or d > self.turning_dist * 1.5 for d in edge)
 
     def _profile_bin_bearing(self, i, n):
         """Camera bearing of profile bin i, radians, positive to the
@@ -5507,7 +5601,8 @@ class TulakObstacle(Node):
         # flat 20 deg released a 29 deg fork before it was steered), held for
         # several cycles (the compass jumped 20 deg within a second near
         # 170448 t=96-103), and only after actually driving some of it.
-        need = min(self.route_turn_done, 0.5 * self._arrow['turn'])
+        need = min(self.route_turn_done, max(self.route_turn_done_frac * self._arrow['turn'],
+                                             self.route_turn_done_min))
         if abs(err) < need and travelled >= 1.0:
             self._arrow['settled'] += 1
         else:
@@ -5516,10 +5611,21 @@ class TulakObstacle(Node):
                      and self._arrow['remaining'] * math.copysign(1.0, self._arrow['todo'])
                      > abs(self._arrow['todo']) + self.route_turn_abandon_extra)
         if self._arrow['settled'] >= 5 or travelled > self.route_turn_timeout_m or wrong_way:
+            done = self._arrow['settled'] >= 5
             print(self.time, 'route turn %s (%.0f deg off exit, %.1fm driven since armed)' % (
-                'done' if self._arrow['settled'] >= 5 else
+                'done' if done else
                 ('abandoned - heading swung away from it' if wrong_way else 'abandoned'),
                 math.degrees(abs(err)), travelled))
+            todo = abs(self._arrow.get('todo') or 0.0)
+            if (not done and self.replan_on_missed_turn and todo > 0
+                    and abs(self._arrow.get('remaining', 0.0)) > self.route_turn_missed_frac * todo):
+                # the turn was armed, counted down and never driven - the
+                # router can plan another way round from here (no U-turn:
+                # its uturn_penalty_m still applies)
+                print(self.time, 'that turn was missed (%.0f deg of %.0f never driven) - asking for a new route'
+                      % (math.degrees(abs(self._arrow['remaining'])), math.degrees(todo)))
+                self.publish('missed_turn', {'remaining_deg': round(math.degrees(self._arrow['remaining']), 1),
+                                             'turn_deg': round(math.degrees(self._arrow['todo']), 1)})
             self._arrow_done_key = self._arrow['key']
             self._turn_done_keys.add(self._arrow['key'])
             self._arrow = None
@@ -5532,9 +5638,12 @@ class TulakObstacle(Node):
             return 0.0
         branch = self.branch_road_right if side < 0 else self.branch_road_left
         target = self.branch_dir_right if side < 0 else self.branch_dir_left
+        blind = self._blind_turn_hint(side, err)
         if target is None:
-            self._arrow['pulling'] = False
-            return 0.0
+            if blind:
+                self._announce_blind(blind, err)
+            self._arrow['pulling'] = abs(blind) >= math.radians(3.0)
+            return blind
         span = max(1e-6, self.route_turn_branch_full_frac - self.route_turn_branch_min_frac)
         visible = max(0.0, min(1.0, (branch - self.route_turn_branch_min_frac) / span))
         remaining = min(1.0, abs(err) / max(1e-6, self.route_turn_hint_full_angle))
@@ -5560,11 +5669,40 @@ class TulakObstacle(Node):
                 hint = visible * (commit - self.last_dir)
                 cap = max(cap, self.route_turn_commit_max)
         if hint * side < 0:
-            self._arrow['pulling'] = False
-            return 0.0
+            hint = 0.0
+        if abs(blind) > abs(hint):
+            self._announce_blind(blind, err)
+            hint, cap = blind, max(cap, self.route_turn_blind)
         hint = max(-cap, min(cap, hint))
         self._arrow['pulling'] = abs(hint) >= math.radians(3.0)
         return hint
+
+    def _blind_turn_hint(self, side, err):
+        """Steering toward an armed turn the camera cannot see - see
+        route_turn_blind_deg in __init__. Radians, + = left, 0 unless all of:
+        the odometry says we are at the junction, the camera still sees road
+        where the robot is (so it has not already left it), and the depth on
+        that side is clear."""
+        arrow = self._arrow
+        if self.route_turn_blind <= 0 or arrow is None or self.route_turn_near_m <= 0:
+            return 0.0
+        if not (-self.route_turn_blind_window_m <= arrow['est'] <= self.route_turn_near_m):
+            return 0.0
+        if self.road_ahead_frac < self.route_turn_blind_min_ahead:
+            return 0.0                      # the camera no longer backs this up
+        side_dist = self.right_dist if side < 0 else self.left_dist
+        if side_dist is not None and side_dist <= self.turning_dist:
+            return 0.0                      # something is there - obstacle avoidance owns this
+        return side * min(self.route_turn_blind, 0.5 * abs(err))
+
+    def _announce_blind(self, blind, err):
+        """Say it once per turn, and only when the map is actually steering -
+        not when the visible branch was already pulling harder."""
+        if self._arrow is not None and not self._arrow.get('blind'):
+            self._arrow['blind'] = True
+            print(self.time, 'no branch visible at the mapped turn %+.0f deg away - steering %+.0f deg by the map '
+                              'while the camera still sees road (%.2f ahead)'
+                   % (math.degrees(err), math.degrees(blind), self.road_ahead_frac))
 
     def _track_turn(self):
         """The turn the router reports next, followed by odometry from the
@@ -5667,15 +5805,56 @@ class TulakObstacle(Node):
         return arrow is not None and (arrow.get('est', float('inf')) <= self.route_turn_slow_m
                                       or arrow.get('pulling', False))
 
+    def _scout_command(self, xy):
+        """(speed, steering) while scouting for the road after the retreats
+        are spent - see road_scout_m in __init__. None when the road is back."""
+        travelled = math.hypot(xy[0] - self._road_scout[0], xy[1] - self._road_scout[1])
+        if self.road_found_streak >= self.road_found_frames:
+            print(self.time, 'road found while scouting after %.1fm - resuming' % travelled)
+            self._road_scout = None
+            return None
+        ahead = self.last_obstacle if self.last_obstacle is not None else float('inf')
+        corridor = self._corridor_hold_dist()
+        if corridor is not None:
+            ahead = min(ahead, corridor)
+        if travelled >= self.road_scout_m or ahead <= self.road_scout_clear_m:
+            print(self.time, 'scouted %.1fm without finding the road (%.1fm clear ahead) - holding'
+                  % (travelled, ahead))
+            self._road_scout = None
+            self._road_hold = True
+            return 0.0, 0.0
+        return self.road_scout_speed, max(-self.road_scout_max, min(self.road_scout_max, self._road_last_dir))
+
+    def _scout_or_hold(self, xy, why):
+        """Start a bounded scout toward the last road the camera saw, or hold
+        where the old code held - see road_scout_m in __init__."""
+        ahead = self.last_obstacle if self.last_obstacle is not None else float('inf')
+        on_road = (self.route_off_road_m is None or self.route_off_road_m <= self.road_scout_on_road_m)
+        if (self.road_scout_m > 0 and self._road_scouts < self.road_scout_tries
+                and on_road and ahead > self.road_scout_clear_m):
+            self._road_scouts += 1
+            self._road_scout = xy
+            print(self.time, '%s - scouting up to %.1fm toward the last road seen (%+.0f deg), %.1fm clear ahead'
+                  % (why, self.road_scout_m, math.degrees(self._road_last_dir), ahead))
+            return self._scout_command(xy)
+        print(self.time, '%s - holding until the road is visible' % why)
+        self._road_hold = True
+        return 0.0, 0.0
+
     def _road_lost_command(self, xy, dt):
         """(speed, steering) while retreating from, or holding after, a lost
         road - see road_lost_retreat_sec in __init__. None when not active."""
         if self.road_lost_retreat_sec <= 0:
             return None
+        if self._road_scout is not None:
+            command = self._scout_command(xy)
+            if command is not None:
+                return command
         if self._road_hold:
             if self.road_found_streak >= self.road_found_frames:
                 print(self.time, 'road visible again - releasing the road-lost hold')
                 self._road_hold = False
+                self._road_scouts = 0
                 return None
             return 0.0, 0.0
         if self._road_retreat is not None:
@@ -5685,17 +5864,13 @@ class TulakObstacle(Node):
                 self._road_retreat = None
                 return None
             if travelled >= self.road_lost_retreat_max_m or not self.retrace_queue:
-                print(self.time, 'road-lost retreat spent (%.1fm) - holding until the road is visible' % travelled)
                 self._road_retreat = None
-                self._road_hold = True
-                return 0.0, 0.0
+                return self._scout_or_hold(xy, 'road-lost retreat spent (%.1fm)' % travelled)
             return -self.backup_speed, self._next_retrace_steering(dt)
         if (self.road_lost and self.state == State.DRIVE and self.road_lost_since is not None
                 and (self.time - self.road_lost_since).total_seconds() >= self.road_lost_retreat_sec):
             if self._road_retreats >= self.road_lost_max_retreats or not self.path_history:
-                print(self.time, 'road lost and no retreat left - holding until the road is visible')
-                self._road_hold = True
-                return 0.0, 0.0
+                return self._scout_or_hold(xy, 'road lost and no retreat left')
             if self._arrow is not None and self._arrow.get('odometry') and self._arrow['est'] > 0:
                 # The road ends before the map's junction: the GPS along-track
                 # error is larger than the distance left (165145: ~10 m under
@@ -6868,8 +7043,22 @@ class TulakObstacle(Node):
 
         elif self.avoid_obstacles and self.turn_streak >= self.close_confirm_frames:
             self._start_avoidance_cycle(xy)
-            if not any_side_clear:
-                if self.in_escape_mode:
+            grass_side, road_side = self._only_clear_side_is_grass()
+            if grass_side and self._road_side_has_gap(road_side):
+                print(self.time, 'the clear side is not road (%.2f vs %.2f) - going round on the road side instead'
+                       % (self.left_road_frac if road_side < 0 else self.right_road_frac,
+                          self.right_road_frac if road_side < 0 else self.left_road_frac))
+                self._forced_turn_sign = road_side
+                self._enter_turning()
+                speed = self.avoid_speed
+                steering_angle = self._limit_tail_swing(self.turn_sign * self.current_avoid_steering)
+            elif not any_side_clear or grass_side:
+                if grass_side:
+                    print(self.time, 'the only clear side is not road (%.2f vs %.2f) and there is no room past '
+                                      'the obstacle - backing up instead of leaving the road'
+                           % (self.left_road_frac, self.right_road_frac))
+                    self._enter_backing_up(0, use_retrace=True)
+                elif self.in_escape_mode:
                     # Retracing means going back the way we came, which in
                     # escape mode is by definition the direction that has
                     # already failed - and it gives back the heading the
