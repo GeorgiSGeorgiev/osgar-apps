@@ -2366,6 +2366,24 @@ class TulakObstacle(Node):
         # 349 deg); the turn armed from the exit bearing anyway and pulled
         # -25 deg for 20 s toward a branch that was behind it. 0 disables.
         self.route_turn_align_max = math.radians(config.get('route_turn_align_max_deg', 0.0))
+        # Heading sources the guard above trusts. odo+gps needs a 4 m GPS
+        # baseline first, so right after a start it is not there yet - at
+        # 164121 t=69 (started 3 m from a -113 deg junction, the start
+        # manoeuvre already facing the exit) the heading was the receiver's
+        # course 132 deg against a route running 38 deg, the guard never
+        # looked, the turn armed for another 105 deg and pulled Matty onto
+        # the lawn. The course over ground is good enough to tell "facing
+        # the approach" from "facing 90 deg away from it".
+        self.route_turn_align_sources = tuple(config.get('route_turn_align_sources', ['odo+gps']))
+        # Refuse a turn whose own numbers disagree: the route itself turns
+        # back at that junction (|turn_dir| over route_turn_max_turn_deg), or
+        # the rotation still to do from the exit bearing is a U-turn or
+        # differs from the router's turn by more than this. After the
+        # missed-turn re-plan at 171129 t=76 the new route started with a
+        # U-turn (turn_dir -180) that the router's chords called +45; the
+        # exit bearing said 161 deg to the RIGHT, it armed, and the map-only
+        # pull took Matty onto the grass. 0 disables.
+        self.route_turn_arm_max_mismatch = math.radians(config.get('route_turn_arm_max_mismatch_deg', 0.0))
         # How much of the turn still counts as "facing the exit". The
         # tolerance is the SMALLER of route_turn_done_deg and this fraction
         # of the turn, floored at route_turn_done_min_deg. At 0.5 a 38 deg
@@ -5749,17 +5767,20 @@ class TulakObstacle(Node):
             self._turn_done_keys.add(track['key'])
             self._turn_track = None
             return          # a jog or a kink, not a turn - see route_turn_min_rel_deg
-        if abs(rel) > self.route_turn_max_turn:
+        sharpest = rel
+        if self.route_turn_arm_max_mismatch > 0 and abs(track['td']) > abs(rel):
+            sharpest = track['td']          # the route turns back here - see route_turn_arm_max_mismatch_deg
+        if abs(sharpest) > self.route_turn_max_turn:
             self._turn_done_keys.add(track['key'])
             self._arrow_done_key = track['key']
             self._turn_track = None
             print(self.time, 'route turn of %+.0f deg %.1fm ahead is sharper than %.0f deg - '
                               'not steering it, following the road' % (
-                                  math.degrees(rel), est, math.degrees(self.route_turn_max_turn)))
+                                  math.degrees(sharpest), est, math.degrees(self.route_turn_max_turn)))
             return
         if self.route_turn_align_max > 0 and track.get('road') is not None:
             heading, source = self._current_heading()
-            if (heading is not None and source == 'odo+gps'
+            if (heading is not None and source in self.route_turn_align_sources
                     and abs(normalize_angle(heading - track['road'])) > self.route_turn_align_max):
                 if not track.get('misaligned_note'):
                     track['misaligned_note'] = True
@@ -5777,6 +5798,16 @@ class TulakObstacle(Node):
                 todo = -normalize_angle(track['exit'] - heading)
                 how = 'exit bearing %.0f deg against odo+gps heading %.0f deg' % (
                     math.degrees(track['exit']) % 360, math.degrees(heading) % 360)
+                if self.route_turn_arm_max_mismatch > 0 and (
+                        abs(todo) > self.route_turn_max_turn
+                        or abs(normalize_angle(todo - rel)) > self.route_turn_arm_max_mismatch):
+                    self._turn_done_keys.add(track['key'])
+                    self._arrow_done_key = track['key']
+                    self._turn_track = None
+                    print(self.time, 'route turn %+.0f deg %.1fm ahead not armed - the %s asks for %+.0f deg, '
+                                      'a U-turn or the wrong way - following the road' % (
+                                          math.degrees(rel), est, how, math.degrees(todo)))
+                    return
         if todo is None:
             return          # nothing driven and no trustworthy heading - wait
         target = normalize_angle(self._odom_heading + todo)

@@ -238,13 +238,13 @@
           "route_turn_commit_window_m": 6.0,
           "route_turn_abandon_extra_deg": 60.0,
           "route_turn_min_rel_deg": 20.0,
-          "route_turn_align_max_deg": 120.0,
+          "route_turn_align_max_deg": 60.0,
           "route_turn_done_frac": 0.25,
           "route_turn_done_min_deg": 8.0,
-          "route_turn_blind_deg": 18.0,
+          "route_turn_blind_deg": 0.0,
           "route_turn_blind_window_m": 3.0,
           "route_turn_blind_min_ahead": 0.6,
-          "replan_on_missed_turn": true,
+          "replan_on_missed_turn": false,
           "route_turn_missed_frac": 0.5,
           "avoid_road_side_veto": true,
           "road_scout_m": 2.0,
@@ -253,7 +253,12 @@
           "road_scout_tries": 1,
           "road_scout_min_frac": 0.3,
           "road_scout_on_road_m": 2.5,
-          "road_scout_clear_m": 1.5
+          "road_scout_clear_m": 1.5,
+          "route_turn_align_sources": [
+            "odo+gps",
+            "gps-course"
+          ],
+          "route_turn_arm_max_mismatch_deg": 90.0
         }
       },
       "osm_router": {
@@ -340,11 +345,12 @@
           "snap_heading_m_per_deg": 0.15,
           "snap_heading_radius_m": 15.0,
           "replan_heading_check_deg": 40.0,
-          "replan_on_missed_turn": true,
-          "enforce_boundary": false,
+          "replan_on_missed_turn": false,
+          "enforce_boundary": true,
           "boundary_osm": "maps/robotour2026-ver1.osm",
           "boundary_min_ways": 5,
-          "replan_max_snap_m": 8.0
+          "replan_max_snap_m": 8.0,
+          "boundary_margin_m": 1000.0
         }
       },
       "platform": {
@@ -522,6 +528,26 @@
           "imu_down_axis": "x",
           "pitch_grade_alpha": 0.02
         }
+      },
+      "audio_player": {
+        "driver": "matty_audio:MattyAudio",
+        "in": [
+          "route_hint",
+          "route_plan"
+        ],
+        "out": [
+          "playing"
+        ],
+        "init": {
+          "waiting_sound": "m02-ready",
+          "waiting_repeat_sec": 30.0,
+          "waiting_repeat_count": 1,
+          "arrived_sound": "arrived",
+          "arrived_repeat_sec": 10.0,
+          "arrived_repeat_count": 3,
+          "target_sound": null,
+          "keepalive_sec": 0.0
+        }
       }
     },
     "links": [
@@ -624,6 +650,14 @@
       [
         "app.missed_turn",
         "osm_router.missed_turn"
+      ],
+      [
+        "osm_router.route_hint",
+        "audio_player.route_hint"
+      ],
+      [
+        "osm_router.route_plan",
+        "audio_player.route_plan"
       ]
     ]
   }

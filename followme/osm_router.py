@@ -1624,10 +1624,14 @@ class OSMRouter(Node):
         was_lost = self.state == RouteState.GPS_LOST
         self.last_fix = (lat, lon)
         self.last_fix_time = self.time
-        self._apply_boundary(lat, lon)
         if self.heading_est is not None and self.time is not None:
             self.heading_est.update_fix(self.time.total_seconds(), lat, lon)
         self._select_map(self.last_fix)
+        # AFTER the map is chosen: _use_map resets the graph to the whole
+        # map, so applying the area first (as before) left the very first
+        # fix planning on the whole map - a QR shown before GPS came up
+        # would have been routed outside the competition area.
+        self._apply_boundary(lat, lon)
         if was_lost:
             print(self.time, 'ROUTE: GPS back at %.6f,%.6f - re-planning to the kept target'
                    % (lat, lon))
