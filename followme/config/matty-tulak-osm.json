@@ -41,7 +41,7 @@
           "max_backup_time_sec": 8.0,
           "max_realign_time_sec": 3.0,
           "terminate_on_stop": true,
-          "enable_ground_hazard": true,
+          "enable_ground_hazard": false,
           "ground_hazard_confirm_frames": 3,
           "terminate_on_ground_hazard": false,
           "follow_gps_target": true,
@@ -183,7 +183,7 @@
           "turn_side_min_road_frac": 0.05,
           "turn_side_road_frac_margin": 0.1,
           "route_turn_closed_loop": true,
-          "ground_hazard_retreat": true,
+          "ground_hazard_retreat": false,
           "mask_center_alpha": 0.4,
           "mask_hold_sec": 0.6,
           "mask_largest_blob": false,
@@ -241,7 +241,7 @@
           "route_turn_align_max_deg": 60.0,
           "route_turn_done_frac": 0.25,
           "route_turn_done_min_deg": 8.0,
-          "route_turn_blind_deg": 0.0,
+          "route_turn_blind_deg": 18.0,
           "route_turn_blind_window_m": 3.0,
           "route_turn_blind_min_ahead": 0.6,
           "replan_on_missed_turn": false,
@@ -258,7 +258,10 @@
             "odo+gps",
             "gps-course"
           ],
-          "route_turn_arm_max_mismatch_deg": 90.0
+          "route_turn_arm_max_mismatch_deg": 90.0,
+          "route_turn_blind_min_turn_deg": 100.0,
+          "road_hold_retry_sec": 5.0,
+          "road_hold_max_retries": 1000
         }
       },
       "osm_router": {

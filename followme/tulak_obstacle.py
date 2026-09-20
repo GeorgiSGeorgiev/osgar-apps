@@ -2294,6 +2294,14 @@ class TulakObstacle(Node):
         self.road_lost_retreat_max_m = config.get('road_lost_retreat_max_m', 3.0)
         self.road_found_frames = config.get('road_found_frames', 5)
         self.road_lost_max_retreats = config.get('road_lost_max_retreats', 2)
+        # A hold ends only when the mask shows road again - and a robot
+        # standing still keeps showing the network the same picture, so on
+        # sunlit cobblestone (2026-09-19) it never did. After holding this
+        # long, start a fresh retreat + scout cycle (a new view for the
+        # network), at most road_hold_max_retries times until 5 s of road
+        # resets the count. 0 = hold for good, as before.
+        self.road_hold_retry_sec = config.get('road_hold_retry_sec', 0.0)
+        self.road_hold_max_retries = config.get('road_hold_max_retries', 0)
 
         # --- heading without the magnetometer (2026-09-15 test8) ---
         # 'compass' (previous) or 'odometry_gps': odometry heading plus an
@@ -2401,6 +2409,12 @@ class TulakObstacle(Node):
         # angle. 0 disables.
         self.route_turn_blind = math.radians(config.get('route_turn_blind_deg', 0.0))
         self.route_turn_blind_window_m = config.get('route_turn_blind_window_m', 3.0)
+        # ...and only for turns at least this sharp. A sharp branch points
+        # behind the camera's view until Matty is half way round, so the map
+        # is all there is; a mild one is visible, and blind steering there
+        # only added GPS timing error (161640 +91 deg: behind the railing).
+        # 0 = every turn, as before.
+        self.route_turn_blind_min_turn = math.radians(config.get('route_turn_blind_min_turn_deg', 0.0))
         # ...and only while the camera sees at least this much road straight
         # ahead, i.e. the robot is demonstrably still ON a road when it starts
         # the turn. Defaults to the off-road threshold.
@@ -2467,6 +2481,8 @@ class TulakObstacle(Node):
         self._road_retreat = None
         self._road_retreats = 0
         self._road_hold = False
+        self._road_hold_since = None
+        self._road_hold_retries = 0
         self.last_dir = 0  # steering angle (rad), from nn_mask
         self.left_road_frac = 0.5
         self.right_road_frac = 0.5
@@ -4058,6 +4074,7 @@ class TulakObstacle(Node):
         self.road_found_streak = self.road_found_streak + 1 if trusted else 0
         if self.road_found_streak >= 50:
             self._road_retreats = 0       # 5 s of road again - a new episode may retreat afresh
+            self._road_hold_retries = 0
 
     def _choose_turn_sign(self):
         """+1 = turn left, -1 = turn right. Prefer the side that is both
@@ -5704,6 +5721,8 @@ class TulakObstacle(Node):
         arrow = self._arrow
         if self.route_turn_blind <= 0 or arrow is None or self.route_turn_near_m <= 0:
             return 0.0
+        if arrow['turn'] < self.route_turn_blind_min_turn:
+            return 0.0                      # mild turn - the camera can see that branch
         if not (-self.route_turn_blind_window_m <= arrow['est'] <= self.route_turn_near_m):
             return 0.0
         if self.road_ahead_frac < self.route_turn_blind_min_ahead:
@@ -5885,9 +5904,25 @@ class TulakObstacle(Node):
             if self.road_found_streak >= self.road_found_frames:
                 print(self.time, 'road visible again - releasing the road-lost hold')
                 self._road_hold = False
+                self._road_hold_since = None
                 self._road_scouts = 0
                 return None
-            return 0.0, 0.0
+            if self._road_hold_since is None:
+                self._road_hold_since = self.time
+            held = (self.time - self._road_hold_since).total_seconds()
+            if (self.road_hold_retry_sec <= 0 or held < self.road_hold_retry_sec
+                    or self._road_hold_retries >= self.road_hold_max_retries):
+                return 0.0, 0.0
+            # see road_hold_retry_sec in __init__: a new view for the network.
+            # Falls through to the retreat below, which starts at once
+            # while the road is still lost.
+            self._road_hold_retries += 1
+            self._road_hold = False
+            self._road_hold_since = None
+            self._road_retreats = 0
+            self._road_scouts = 0
+            print(self.time, 'no road for %.0fs while holding - retry %d/%d: retreat and scout again'
+                  % (held, self._road_hold_retries, self.road_hold_max_retries))
         if self._road_retreat is not None:
             travelled = math.hypot(xy[0] - self._road_retreat[0], xy[1] - self._road_retreat[1])
             if self.road_found_streak >= self.road_found_frames:
