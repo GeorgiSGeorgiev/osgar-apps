@@ -157,14 +157,38 @@ def make_video_reader(tmp_path):
     return read_image
 
 
-def colorize_depth(depth_mm, max_mm):
-    """near = warm/red, far = cool/blue, invalid (0) = black."""
+def colorize_depth(depth_mm, max_mm, far_fill_mm=None):
+    """near = warm/red, far = cool/blue, invalid (0) = black, and the
+    driver's synthetic "far" fill in flat grey.
+
+    That last part matters and is not cosmetic. The oak driver replaces
+    invalid pixels in the upper frame with depth_far_mask_value_mm (15000)
+    to say "nothing near here" - see depth_far_mask_* in oak_camera_v3.
+    Those pixels are not measurements. Coloured on the same scale as the
+    rest they clip to the far end of the JET map and read as a clean,
+    confident, uniformly distant background, which is exactly the part of
+    this picture that impresses people who ask why their OAK-D looks
+    noisier. Over 400 frames of run 133922, 47.5% of the frame was that
+    fill, 23.3% was invalid and only 29.3% was a real stereo reading -
+    93% fill inside the centre obstacle window. The detector already
+    treats the fill with suspicion (far_fill_suspect_m); the viewer
+    should not show it as data."""
     valid = depth_mm > 0
     clipped = np.clip(depth_mm, 0, max_mm).astype(np.float32)
     inverted = 255 - clipped / max_mm * 255
     color = cv2.applyColorMap(inverted.astype(np.uint8), cv2.COLORMAP_JET)
     color[~valid] = (0, 0, 0)
+    if far_fill_mm:
+        color[depth_mm == far_fill_mm] = (70, 70, 70)
     return color
+
+
+def depth_census(depth_mm, far_fill_mm):
+    """(real, fill, invalid) as percentages of the frame."""
+    px = float(depth_mm.size)
+    fill = float((depth_mm == far_fill_mm).sum()) if far_fill_mm else 0.0
+    invalid = float((depth_mm == 0).sum())
+    return (100.0 * (px - fill - invalid) / px, 100.0 * fill / px, 100.0 * invalid / px)
 
 
 def draw_drivable_area(color_img, mask):
@@ -491,10 +515,15 @@ def build_hud_lines(dt, app, zones, reason_log, osm=None):
 
 
 def render_frame(dt, depth_mm, color_img, mask, app, zones, reason_log, max_depth_mm, depth_scale, color_size,
-                  right_panel='color', osm=None):
+                  right_panel='color', osm=None, far_fill_mm=None):
     h, w = depth_mm.shape
-    depth_panel = cv2.resize(colorize_depth(depth_mm, max_depth_mm), (w * depth_scale, h * depth_scale),
+    depth_panel = cv2.resize(colorize_depth(depth_mm, max_depth_mm, far_fill_mm),
+                              (w * depth_scale, h * depth_scale),
                               interpolation=cv2.INTER_NEAREST)
+    real, fill, invalid = depth_census(depth_mm, far_fill_mm)
+    cv2.putText(depth_panel, 'depth %.0f%% measured  %.0f%% far-fill  %.0f%% invalid'
+                % (real, fill, invalid), (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (255, 255, 255), 1, cv2.LINE_AA)
 
     draw_zone(depth_panel, zones.base_rows, zones.center_cols, (90, 90, 90), '', depth_scale, thickness=1)
     draw_zone(depth_panel, zones.rows, zones.left_cols, (255, 255, 0), 'L', depth_scale)
@@ -532,6 +561,7 @@ def render_frame(dt, depth_mm, color_img, mask, app, zones, reason_log, max_dept
 
 
 def read_logfile(logfile, max_depth_mm=4000, show_color=True, depth_scale=2, start_sec=0.0, writer=None,
+                  far_fill_mm=None,
                   right_panel='color', verbose=False):
     full_cfg = lookup_config(logfile)['robot']
     modules = full_cfg['modules']
@@ -607,7 +637,7 @@ def read_logfile(logfile, max_depth_mm=4000, show_color=True, depth_scale=2, sta
 
                 frame = render_frame(dt, data, color_img, last_mask, app, zones, reason_log,
                                       max_depth_mm, depth_scale, color_size if show_color else None,
-                                      right_panel=right_panel, osm=osm)
+                                      right_panel=right_panel, osm=osm, far_fill_mm=far_fill_mm)
                 cv2.imshow('Matty obstacle viewer', frame)
                 if writer is not None:
                     writer.write(frame)
@@ -666,6 +696,10 @@ def main():
                               "(nn_mask) overlay on the color image, same view as robotem-rovne/view_mask.py "
                               "(default: color)")
     parser.add_argument('--start-sec', type=float, default=0.0, help='skip ahead to this time in the log')
+    parser.add_argument('--no-mark-far-fill', action='store_true',
+                         help="colour the driver's synthetic far-field fill (depth_far_mask_value_mm) like "
+                              "any other depth instead of flat grey - see colorize_depth for why it is "
+                              "marked by default")
     parser.add_argument('--verbose', '-v', action='store_true',
                          help="enable each replayed node's own verbose printouts (fed into \"recent events\" "
                               "above, same as osgar.replay --verbose) - noisy at full-log length; the IMU raw "
@@ -678,9 +712,15 @@ def main():
     for logfile in args.logfile:
         writer = VideoWriter(args.create_video, args.fps) if args.create_video is not None else None
 
+        # what THIS log's oak module was told to fill the far field with,
+        # so the viewer can mark it rather than colour it as a measurement
+        far_fill = lookup_config(logfile)['robot']['modules'].get('oak', {}).get(
+                'init', {}).get('depth_far_mask_value_mm', 15000)
+        if args.no_mark_far_fill:
+            far_fill = None
         read_logfile(logfile, max_depth_mm=args.max_depth_mm, show_color=not args.no_color,
                      depth_scale=args.depth_scale, start_sec=args.start_sec, writer=writer,
-                     right_panel=args.right_panel, verbose=args.verbose)
+                     right_panel=args.right_panel, verbose=args.verbose, far_fill_mm=far_fill)
 
         if writer is not None:
             writer.release()

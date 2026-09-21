@@ -40,7 +40,12 @@ from tulak_obstacle import TulakObstacle
 
 CONFIG = 'config/matty-tulak-osm.json'
 START_FIX = (50.105834, 14.427345)          # a real Stromovka path
-TARGET = '50.106589, 14.417428'
+# 140 m away, and INSIDE the competition area (see load_boundary_ways).
+# It has to be: with enforce_boundary on - which is how the robot runs -
+# the router refuses a target outside the area, and every test below that
+# expects a plan would fail for a reason that has nothing to do with the
+# QR protocol it is testing.
+TARGET = '50.104657, 14.428039'
 
 
 class Harness:
@@ -117,7 +122,7 @@ def test_protocol():
           'FREE gives the follower no target and no hold')
     check(h.hint['cross_track_m'] is None,
           'FREE withholds cross-track, so no stale corridor bias')
-    check(abs(h.app._route_corridor_bias()) < 1e-9, 'FREE produces zero route bias')
+    check(h.app._arrow_turn_hint() == 0.0, 'FREE produces no route steering at all')
 
     plans = h.rbus.counts.get('route_plan', 0)
     h.qr('start')
@@ -340,7 +345,10 @@ def test_articulated_steering_guard():
 
     # the memory is what makes it work - the live zone loses the obstacle
     app.left_dist = app.right_dist = 99.0
-    app._flank_history[-1].append((datetime.timedelta(0), (0.0, 0.0), 1.0))
+    # (time, where the robot was, range, where the thing is) - the last
+    # field was added when the memory learned to re-express a remembered
+    # obstacle relative to wherever the robot has moved to since.
+    app._flank_history[-1].append((datetime.timedelta(0), (0.0, 0.0), 1.0, (0.0, -1.0)))
     remembered = app._articulated_steering_limit(-1)
     check(remembered is not None and math.degrees(remembered) < 35,
           'a remembered flank the camera can no longer see still limits the turn (%.0f deg)'

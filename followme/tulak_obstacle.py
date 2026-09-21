@@ -1156,6 +1156,7 @@ from enum import Enum
 import cv2
 import numpy as np
 
+import road_geometry
 from osgar.node import Node
 
 
@@ -1175,6 +1176,26 @@ class _ReadTrackingConfig(dict):
     # not to any node, and most nodes never read it.
     FRAMEWORK_KEYS = frozenset(['env'])
 
+    # Settings this file used to have and deliberately no longer does.
+    # They are not an error: every log recorded before they were removed
+    # still carries them, and replaying one must not be impossible. They
+    # ARE worth a line on the console, because a config still setting one
+    # is a config whose author thinks it does something.
+    #
+    # All of these belonged to the pre-'arrow' guidance path - steering by
+    # the bearing to a rolling aim point, blended against the road mask by
+    # the router's authority, plus a smoothed cross-track bias and an
+    # open-loop turn hint. route_guidance_style has selected 'arrow' since
+    # 2026-09-12 and every measurement since was taken with it, so the
+    # whole path was unreachable code. See _drive_steering.
+    RETIRED_KEYS = frozenset([
+        'route_guidance_style', 'follow_gps_target', 'route_cross_track_gain_deg_per_m',
+        'route_heading_gain', 'route_bias_max_deg', 'route_bias_alpha', 'corridor_aim_frac',
+        'route_min_road_frac', 'route_veto_authority', 'route_bearing_authority_max',
+        'bearing_blend_road_frac', 'route_turn_closed_loop', 'tube_reference_halfwidth_m',
+        'junction_edge_yield', 'route_offroad_authority',
+    ])
+
     def __init__(self, data):
         super().__init__(data)
         self.read_keys = set()
@@ -1188,7 +1209,11 @@ class _ReadTrackingConfig(dict):
         return super().__getitem__(key)
 
     def unread(self):
-        return sorted(set(self.keys()) - self.read_keys - self.FRAMEWORK_KEYS)
+        return sorted(set(self.keys()) - self.read_keys - self.FRAMEWORK_KEYS
+                      - self.RETIRED_KEYS)
+
+    def retired(self):
+        return sorted(set(self.keys()) & self.RETIRED_KEYS)
 
 from osgar.exceptions import EmergencyStopException
 
@@ -1265,6 +1290,10 @@ def weighted_mask_center_x(mask, sky_row):
     if total <= 0:
         return float(xs.mean())
     return float((xs * weights).sum() / total)
+
+
+def _fmt(value, places=2):
+    return '-' if value is None else ('%.*f' % (places, value))
 
 
 def normalize_angle(angle):
@@ -1366,6 +1395,7 @@ class State(Enum):
     BACKING_UP = 1
     TURNING = 2
     REALIGNING = 3
+    TURN_AROUND = 4
 
 
 class TulakObstacle(Node):
@@ -1374,7 +1404,7 @@ class TulakObstacle(Node):
         # a config key nothing reads means the config is newer than this
         # file - see _ReadTrackingConfig and the check at the end of __init__
         config = _ReadTrackingConfig(config)
-        bus.register('desired_steering', 'missed_turn')
+        bus.register('desired_steering', 'missed_turn', 'road_axis')
 
         # driving
         self.max_speed = config.get('max_speed', 0.5)
@@ -1390,6 +1420,61 @@ class TulakObstacle(Node):
                 'mask_reference_hfov_deg',
                 math.degrees(math.atan(math.tan(math.radians(self.camera_hfov_deg) / 2) * 0.75)) * 2)
         self._mask_fov_reported = None
+        # The same mask, read as GROUND rather than as a picture: where the
+        # road is in metres, so the router can line its map up with it. See
+        # road_geometry.py for the projection and map_fusion.py for what
+        # this feeds. Costs one numpy pass over ~35 mask rows per frame and
+        # steers nothing here. publish_road_axis=False turns it off.
+        self.publish_road_axis = config.get('publish_road_axis', True)
+        self.road_axis_camera_height_m = config.get('road_axis_camera_height_m',
+                                                    road_geometry.CAMERA_HEIGHT_M)
+        self.road_axis_horizon_row_frac = config.get('road_axis_horizon_row_frac',
+                                                     road_geometry.HORIZON_ROW_FRAC)
+        self.road_axis_branch_m = config.get('road_axis_branch_m', 1.0)
+        self._projection = None
+        self._road_profile = None
+        self.road_branch_left_m = None      # distance to a fork seen on that side
+        self.road_branch_right_m = None
+
+        # --- turning around (State.TURN_AROUND) ---
+        # Two of the four competition runs ended at a place where the route
+        # doubled back and nothing could drive it. 080142 t=684: "route
+        # turn +143 deg in 12.0m armed" then "abandoned (186 deg off exit,
+        # 20.0m driven)" - the arrow steers toward road it can SEE on the
+        # turn side, and the exit of a 143 deg turn is 70 deg outside the
+        # camera. 133922 t=637: "route turn 8.5m ahead not armed - heading
+        # 184 deg, the route runs 8 deg here", i.e. the plan ran back the
+        # way Matty had come and the alignment gate correctly refused to
+        # steer it as an ordinary fork.
+        #
+        # Neither is a steering-blend problem, they are a manoeuvre the
+        # robot did not have. The geometry says it fits: at 45 deg of
+        # joint the pivot radius is (0.32/2)/tan(22.5) = 0.39 m and the
+        # outer rear corner sweeps about 0.55 m, so a full about-turn
+        # needs ~1.1 m of width - comfortably inside a 2.4 m Stromovka
+        # footway. What it needs is to be driven deliberately, in legs,
+        # against the odometry heading rather than against the picture.
+        self.turn_around_enabled = config.get('turn_around_enabled', True)
+        # how far round the route has to ask the robot to come before this
+        # takes over from the ordinary arrow
+        self.uturn_min_turn = math.radians(config.get('uturn_min_turn_deg', 110.0))
+        self.uturn_confirm_sec = config.get('uturn_confirm_sec', 2.0)
+        self.uturn_speed = config.get('uturn_speed', 0.15)
+        self.uturn_steering = math.radians(config.get('uturn_steering_deg', 45.0))
+        self.uturn_leg_m = config.get('uturn_leg_m', 1.5)
+        self.uturn_reverse_m = config.get('uturn_reverse_m', 0.8)
+        self.uturn_max_legs = config.get('uturn_max_legs', 8)
+        self.uturn_timeout_sec = config.get('uturn_timeout_sec', 90.0)
+        self.uturn_done = math.radians(config.get('uturn_done_deg', 25.0))
+        self.uturn_min_road_frac = config.get('uturn_min_road_frac', 0.20)
+        self.uturn_min_room_m = config.get('uturn_min_room_m', 0.8)
+        self.uturn_retry_sec = config.get('uturn_retry_sec', 30.0)
+        self._uturn = None
+        self._uturn_wanted_since = None
+        self._uturn_blocked_until = None
+        self._uturn_request = None
+        self._uturn_room_note = None
+        self._uturn_todo = 0.0
 
         # obstacle safety / avoidance
         # stop_dist/turning_dist below are the STATIC starting values -
@@ -1560,7 +1645,6 @@ class TulakObstacle(Node):
         # comes from a decoded QR code, current heading from differencing
         # consecutive GPS fixes (NOT from IMU 'rotation' - deliberately;
         # see docstring)
-        self.follow_gps_target = config.get('follow_gps_target', True)  # <-- on/off switch
         # field-tested (see item 9 at top of file): 1.0m let ordinary GPS
         # jitter alone cross the baseline and get read as real motion,
         # producing a travel_heading that swung 200+ degrees in a few
@@ -1574,7 +1658,6 @@ class TulakObstacle(Node):
         # smoothing in obstdet3d_zones.py. 1.0 = no smoothing.
         self.gps_heading_smoothing_alpha = config.get('gps_heading_smoothing_alpha', 0.4)
         self.waypoint_arrival_dist_m = config.get('waypoint_arrival_dist_m', 3.0)
-        self.bearing_blend_road_frac = config.get('bearing_blend_road_frac', 0.3)
         # near-target bearing fade (item 16 at top of file) - GPS position
         # noise (unavoidable without RTK) turns into growing BEARING error
         # as target_dist shrinks (a fixed few meters of position noise is
@@ -1832,11 +1915,6 @@ class TulakObstacle(Node):
         # real (1-3m), so this must never translate a noisy fix into a
         # sharp correction - it is the LOW-FREQUENCY term, and the mask
         # keeps the fast one.
-        self.route_cross_track_gain = math.radians(
-            config.get('route_cross_track_gain_deg_per_m', 3.0))
-        self.route_heading_gain = config.get('route_heading_gain', 0.35)
-        self.route_bias_max = math.radians(config.get('route_bias_max_deg', 15.0))
-        self.route_bias_alpha = config.get('route_bias_alpha', 0.15)
         self._route_bias = 0.0
 
         # --- how much the road mask is worth right now (item 29) ---
@@ -1871,10 +1949,8 @@ class TulakObstacle(Node):
         # corridor branch. Reached at mask_trust_cross_none_m, scaled
         # linearly from 0 at mask_trust_cross_full_m. 0 disables (the
         # corridor stays a pure additive bias, as before).
-        self.route_offroad_authority = config.get('route_offroad_authority', 0.0)
         # Half-width the cross-track gain is expressed FOR - see
         # _route_corridor_bias. 0 disables the tube normalisation.
-        self.tube_reference_halfwidth_m = config.get('tube_reference_halfwidth_m', 0.0)
         # --- junction turn hint (item 39) - see _route_turn_hint ---
         # Ceiling on the additive push toward the next turn, the distance
         # over which it ramps in, and the turn angle at which it reaches
@@ -1889,7 +1965,6 @@ class TulakObstacle(Node):
         self.junction_hint_gain = config.get('junction_hint_gain', 3.0)
         # close the hint on heading toward the route's exit bearing - see
         # _route_turn_hint. False keeps the open-loop turn-angle hint.
-        self.route_turn_closed_loop = config.get('route_turn_closed_loop', False)
         # --- asymmetric damping of the outward depth nudge (item 38) ---
         # See _damp_outward. Starts well inside the road, because it is
         # not a correction - it only declines to push further out - and
@@ -1924,13 +1999,11 @@ class TulakObstacle(Node):
         # Fraction of the router's cruise authority the aim point gets in
         # corridor mode - see _drive_steering. 0 restores the previous
         # bias-only behaviour.
-        self.corridor_aim_frac = config.get('corridor_aim_frac', 0.0)
         # How much of the route's junction authority an urgent depth edge
         # takes back - see _drive_steering's junction branch. 0 restores
         # the previous behaviour (the route keeps full authority through a
         # fork whatever is beside the robot); 1.0 lets a full-strength
         # edge correction silence the route entirely.
-        self.junction_edge_yield = config.get('junction_edge_yield', 0.0)
         # Speed ceiling for REALIGNING, as a fraction of what
         # _adaptive_speed would otherwise allow. REALIGNING is the one
         # forward-driving state that ignores the depth-based steering
@@ -1968,12 +2041,10 @@ class TulakObstacle(Node):
         # to drive there. 0 disables.
         self.offroad_hold_m = config.get('offroad_hold_m', 0.0)
         self.offroad_hold_active = False
-        self.route_min_road_frac = config.get('route_min_road_frac', 0.02)
         # what the route's authority is cut to when that veto fires - not
         # zero, because "the mask sees nothing that way" is also what a
         # blinded or badly-lit frame looks like, and the map is then the
         # better of two poor witnesses
-        self.route_veto_authority = config.get('route_veto_authority', 0.3)
         # What "hold: creep" means for this robot. 0.0 = stand still until
         # the router has a plan (i.e. until the start QR has been read),
         # which is the safe default: crawling forward before knowing where
@@ -2262,8 +2333,6 @@ class TulakObstacle(Node):
         #     projection jumps past the junction (17:12:27, t=58.6 s)
         #   - turns sharper than route_turn_max_turn_deg (U-turns from a
         #     replan, 17:26:15 t=96 s) are not steered at all
-        self.route_guidance_style = config.get('route_guidance_style', 'legacy')
-        self.route_bearing_authority_max = config.get('route_bearing_authority_max', 1.0)
         self.route_turn_max_turn = math.radians(config.get('route_turn_max_turn_deg', 180.0))
         self.route_turn_branch_min_frac = config.get('route_turn_branch_min_frac', 0.05)
         self.route_turn_branch_full_frac = config.get('route_turn_branch_full_frac', 0.20)
@@ -2894,6 +2963,11 @@ class TulakObstacle(Node):
         # 2026-09-12 a config deployed ahead of the code it configures cost
         # a whole test session, and the only symptom was a setting quietly
         # not being there.
+        retired = config.retired()
+        if retired:
+            print('tulak_obstacle: %d setting(s) in this config no longer exist and are being '
+                  'ignored: %s. They belonged to the pre-arrow guidance path - see '
+                  '_ReadTrackingConfig.RETIRED_KEYS.' % (len(retired), ', '.join(retired)))
         unread = config.unread()
         if unread:
             raise ValueError(
@@ -3899,7 +3973,43 @@ class TulakObstacle(Node):
                   % (width, height, math.degrees(math.atan(tan_mask)) * 2, scale))
         return scale
 
+    def _publish_road_axis(self, raw_mask):
+        """Publish where the road is in METRES, for the router's map
+        fusion - see road_geometry.py and map_fusion.py.
+
+        Deliberately reads the UNTOUCHED mask, not the one on_nn_mask has
+        blanked above the horizon and possibly reduced to its largest
+        blob: this answers a different question from the steering and must
+        not inherit choices made for that one. It also never smooths -
+        map_fusion is the filter, and filtering twice hides how noisy the
+        measurement really is."""
+        height, width = raw_mask.shape
+        if self._projection is None or self._projection.width != width:
+            self._projection = road_geometry.Projection(
+                    width, height,
+                    camera_height_m=self.road_axis_camera_height_m,
+                    horizon_row_frac=self.road_axis_horizon_row_frac,
+                    hfov_deg=self.camera_hfov_deg)
+        profile = self._road_profile = road_geometry.road_profile(raw_mask, self._projection)
+        axis = road_geometry.trunk(profile)
+        branch = road_geometry.branches(profile, axis, min_extent_m=self.road_axis_branch_m)
+        left = [b['x_peak'] for b in branch if b['side'] == 'left']
+        right = [b['x_peak'] for b in branch if b['side'] == 'right']
+        self.road_branch_left_m = min(left) if left else None
+        self.road_branch_right_m = min(right) if right else None
+        self.publish('road_axis', {
+            'y0': None if axis is None else round(axis[0], 3),
+            'slope': None if axis is None else round(axis[1], 4),
+            'half': None if axis is None else round(axis[2], 3),
+            'n': 0 if axis is None else axis[3],
+            'frac': round(float(raw_mask[height // 2:, :].mean()), 3),
+            'branch_left_m': self.road_branch_left_m,
+            'branch_right_m': self.road_branch_right_m,
+        })
+
     def on_nn_mask(self, data):
+        if self.publish_road_axis:
+            self._publish_road_axis(data)
         mask = data.copy()  # never modify the shared buffer in place
         height, width = mask.shape
         mask[:height // 2, :] = 0  # ignore sky/horizon in the top half
@@ -5227,8 +5337,7 @@ class TulakObstacle(Node):
         if self.max_steering_rate is None or dt is None:
             return target
         rate = self.max_steering_rate
-        if self.route_mode and self.route_steer_rate and (
-                self.route_rate_boost or self.route_guidance_style != 'arrow'):
+        if self.route_mode and self.route_steer_rate and self.route_rate_boost:
             # A junction turn has to be wound on inside the junction. At
             # the cruising 30deg/s default, reaching 40deg takes 1.3s -
             # 0.65m at cruising speed, most of the way across the fork -
@@ -5517,58 +5626,6 @@ class TulakObstacle(Node):
             return 1.0
         return min(1.0, (cross - self.mask_trust_cross_full_m) / span)
 
-    def _route_turn_hint(self):
-        """A small, EARLY additive push toward the way the route turns
-        next. Radians, positive left; 0 when there is no turn ahead, no
-        geometry for it, or the feature is switched off.
-
-        This is what is left of the route once a constant GPS offset is
-        taken seriously. Position-derived guidance - cross-track, the
-        off-road distance, the bearing to an aim point - all inherit a
-        bias measured at up to 3.17m holding its direction to within a
-        degree across a whole run, so all of them can and did steer the
-        robot off a road it was tracking correctly. The turn's DIRECTION
-        does not: it comes from the polyline, and the only thing the fix
-        has to get right is which junction is next and roughly how far,
-        which a 3m error inside a 12m approach does not change.
-
-        Shaped like the depth edge nudge rather than like a waypoint: it
-        ramps in over route_turn_hint_lead_m so the camera is already
-        coming round before the junction arrives, instead of arriving as
-        a late demand for a large turn. It is capped well below the road
-        mask's own authority, so it biases which way Matty drifts while
-        the mask keeps deciding where the road actually is - the mask can
-        always overrule it, which is the point.
-
-        Scaled by how sharp the turn is, so a 30 deg bend gets a nudge and
-        a 90 deg fork gets the full hint."""
-        if self.route_turn_hint_max <= 0 or self.route_turn_dir is None:
-            return 0.0
-        if self.route_turn_dist_m is None or self.route_turn_dist_m > self.route_turn_hint_lead_m:
-            return 0.0
-        # 0 at the far edge of the lead distance, 1 at the junction itself
-        ramp = 1.0 - self.route_turn_dist_m / max(1e-6, self.route_turn_hint_lead_m)
-        # CLOSED on heading: push toward the bearing the route leaves the
-        # turn on, in proportion to how far the robot still is from it, so
-        # the hint stops by itself once the robot faces the exit.
-        #
-        # The open-loop version (turn angle x ramp, below) only ever knew
-        # "the route turns left 4m ahead" - never "I have already turned".
-        # Between the dormitory buildings the fix stopped advancing along
-        # the route, so turn_dist sat at 3.4-5.1m, the hint stayed at
-        # +6..7deg, junction_hint_gain tripled it, and Matty drove a
-        # 301 deg circle in 21s (2026-09-11 run 174423 t=173-194). A
-        # target BEARING cannot produce that: once it is reached the
-        # command is zero, whatever the fix is doing. The exit bearing is
-        # read off the polyline, so the GPS bias cannot touch it either.
-        heading, _src = self._current_heading()
-        if self.route_turn_closed_loop and self.route_exit_bearing is not None and heading is not None:
-            err = normalize_angle(self.route_exit_bearing - heading)   # +ve: exit lies clockwise (right)
-            remaining = min(1.0, abs(err) / max(1e-6, self.route_turn_hint_full_angle))
-            return -math.copysign(self.route_turn_hint_max * ramp * remaining, err)
-        sharp = min(1.0, abs(self.route_turn_dir) / max(1e-6, self.route_turn_hint_full_angle))
-        return math.copysign(self.route_turn_hint_max * ramp * sharp, self.route_turn_dir)
-
     def _arrow_turn_hint(self):
         """Steering nudge toward a planned turn, satnav-arrow style - see
         route_guidance_style in __init__. Returns radians, + = left.
@@ -5829,6 +5886,21 @@ class TulakObstacle(Node):
                     return
         if todo is None:
             return          # nothing driven and no trustworthy heading - wait
+        if (self.turn_around_enabled and abs(todo) >= self.uturn_min_turn
+                and est <= self.route_turn_near_m):
+            # Too far round to steer as a fork: the arrow pulls toward road
+            # it can SEE on the turn side and the exit of a 140 deg turn is
+            # outside the camera entirely - that is 080142 t=684, "armed"
+            # then "abandoned, 186 deg off exit, 20 m driven". Hand it to
+            # the about-turn manoeuvre, which drives against the odometry
+            # heading and needs to see nothing.
+            self._uturn_request = {'todo': todo, 'at': self.time}
+            self._turn_done_keys.add(track['key'])
+            self._arrow_done_key = track['key']
+            self._turn_track = None
+            print(self.time, 'route turn %+.0f deg is too far round to steer as a fork (%s) - '
+                              'turning around instead' % (math.degrees(todo), how))
+            return
         target = normalize_angle(self._odom_heading + todo)
         self._arrow = dict(key=track['key'], exit=target, start=self._last_xy, turn=abs(rel), settled=0,
                            arm_dist=est, anchor=track['anchor'], est=est, odometry=True, pulling=False,
@@ -5836,6 +5908,211 @@ class TulakObstacle(Node):
         self._turn_track = None
         print(self.time, 'route turn %+.0f deg in %.1fm armed (%s), will steer when a branch is visible' % (
             math.degrees(rel), est, how))
+
+    # --- turning around -------------------------------------------------
+    def _road_room(self, side, x_lo=1.5, x_hi=3.5):
+        """How much road there is on one flank, in metres, from the ground
+        projection of the mask (+1 left, -1 right). None when the mask has
+        nothing to say there.
+
+        An edge the picture cuts off counts as AT LEAST the frame's own
+        half-width there, which is the honest reading: the road may well
+        go further, we just cannot see it."""
+        prof = self._road_profile
+        if prof is None:
+            return None
+        key = 'left' if side > 0 else 'right'
+        vals = []
+        for i, x in enumerate(prof['x']):
+            if not (x_lo <= x <= x_hi) or prof[key][i] is None:
+                continue
+            vals.append(abs(prof[key][i]))
+        if not vals:
+            return None
+        return float(sorted(vals)[len(vals) // 2])
+
+    def _uturn_side(self, todo):
+        """Which way to swing the nose round. The route's own direction
+        wins unless that side has no room and the other one does."""
+        want = 1 if todo > 0 else -1
+        room_want = self._road_room(want)
+        room_other = self._road_room(-want)
+        flank_want = self._lateral_clearance(want)
+        flank_other = self._lateral_clearance(-want)
+        blocked = lambda room, flank: ((room is not None and room < self.uturn_min_room_m)
+                                       or (flank is not None and flank < self.uturn_min_room_m))
+        if blocked(room_want, flank_want) and not blocked(room_other, flank_other):
+            return -want
+        return want
+
+    def _turn_around_todo(self):
+        """Signed rotation the route wants, radians, + = left, or None.
+
+        The route's LOCAL direction where the robot is standing, against
+        the odometry+GPS heading. Deliberately not the exit bearing: that
+        belongs to the next turn on the route, which can be two hundred
+        metres away - in run 080142 at t=287 the road ran 291 deg, the
+        robot was pointing 291 deg, and the exit bearing of a fork 201 m
+        further on read 96 deg. Reading that as "the route runs backwards"
+        would have turned a perfectly good run around in the middle of a
+        straight."""
+        heading, source = self._current_heading()
+        if heading is None or source not in self.route_turn_align_sources:
+            return None
+        if self.route_road_bearing is None:
+            return None
+        return -normalize_angle(self.route_road_bearing - heading)
+
+    def _uturn_room_ok(self, sign):
+        """Enough width on both flanks to swing the chassis round.
+
+        At 45 deg of joint the pivot radius is 0.39 m and the outer rear
+        corner reaches about 0.55 m, so both sides need roughly 0.8 m.
+        A side nothing can measure does not block it - refusing to turn
+        because the mask ends outside the frame would refuse on every
+        wide road."""
+        for side in (sign, -sign):
+            where = 'left' if side > 0 else 'right'
+            room = self._road_room(side)
+            if room is not None and room < self.uturn_min_room_m:
+                return False, 'only %.2f m of road on the %s' % (room, where)
+            flank = self._lateral_clearance(side)
+            if flank is not None and flank < self.uturn_min_room_m:
+                return False, 'only %.2f m clear on the %s' % (flank, where)
+        return True, ''
+
+    def _should_turn_around(self):
+        """True when the route needs the robot to end up facing backwards
+        and there is room to get there.
+
+        Two ways in, and they answer different questions:
+
+          the route here runs the other way - the plan doubles back on
+            itself where the robot is standing, which is what the router
+            produces once a turn has been missed and the next usable
+            junction is behind. Needs confirming over time because a
+            re-plan can show it for a cycle or two.
+          a fork the route turns more than uturn_min_turn_deg through -
+            requested by _arm_odometry_turn at the moment it would
+            otherwise have armed the arrow. No confirmation needed: that
+            code has already tracked the fork over many metres.
+        """
+        if not self.turn_around_enabled or not self.route_mode:
+            self._uturn_request = None
+            return False
+        if (self.route_hold or self.in_escape_mode or self._arrow is not None
+                or (self._uturn_blocked_until is not None and self.time < self._uturn_blocked_until)):
+            return False
+        todo = None
+        if self._uturn_request is not None:
+            if (self.time - self._uturn_request['at']).total_seconds() < 2.0:
+                todo = self._uturn_request['todo']
+            else:
+                self._uturn_request = None
+        if todo is None:
+            wrong_way = self._turn_around_todo()
+            if wrong_way is None or abs(wrong_way) < self.uturn_min_turn:
+                self._uturn_wanted_since = None
+                return False
+            if self.route_state not in ('following', 'recovering'):
+                return False
+            if self._uturn_wanted_since is None:
+                self._uturn_wanted_since = self.time
+                return False
+            if (self.time - self._uturn_wanted_since).total_seconds() < self.uturn_confirm_sec:
+                return False
+            todo = wrong_way
+        if self.road_ahead_frac < self.uturn_min_road_frac:
+            return False                # not on a road - find one first
+        if self.route_off_road_m is not None and self.route_off_road_m > 2.0:
+            return False                # the map says we are off the path anyway
+        ok, why = self._uturn_room_ok(self._uturn_side(todo))
+        if not ok:
+            # once every uturn_retry_sec, not every cycle: on a noisy mask
+            # the measured width moves a few centimetres every frame and
+            # this would otherwise be the loudest line in the log
+            if (self._uturn_room_note is None
+                    or (self.time - self._uturn_room_note).total_seconds() >= self.uturn_retry_sec):
+                self._uturn_room_note = self.time
+                print(self.time, 'the route asks for a %.0f deg about-turn here, but there is %s - '
+                                 'carrying on instead' % (math.degrees(abs(todo)), why))
+            return False
+        self._uturn_room_note = None
+        self._uturn_todo = todo
+        return True
+
+    def _enter_turn_around(self):
+        todo = self._uturn_todo
+        self._uturn_request = None
+        sign = self._uturn_side(todo)
+        self.state = State.TURN_AROUND
+        self.state_start_time = self.time
+        self._uturn = dict(target=todo, sign=sign, unwrap0=self._odo_unwrapped, leg=1,
+                           direction=1, leg_start=self._odo_travel, start=self.time)
+        self._uturn_wanted_since = None
+        print(self.time, 'turning around: the route runs %+.0f deg from here, swinging %s '
+                         '(road room %s m, flank %s m)'
+              % (math.degrees(todo), 'left' if sign > 0 else 'right',
+                 _fmt(self._road_room(sign)), _fmt(self._lateral_clearance(sign))))
+
+    def _abort_turn_around(self, why):
+        print(self.time, 'turn around abandoned after %d legs - %s' % (self._uturn['leg'], why))
+        self._uturn = None
+        self._uturn_wanted_since = None
+        self._uturn_blocked_until = self.time + datetime.timedelta(seconds=self.uturn_retry_sec)
+        self._enter_drive()
+
+    def _turn_around_command(self, dt):
+        """Drive the about-turn, in legs, until the odometry heading has
+        come round far enough.
+
+        Forward legs steer hard toward the chosen side and stop on
+        whichever comes first: the leg length, something inside
+        turning_dist, or the road mask running out ahead. Reverse legs
+        counter-steer, so the nose keeps coming round instead of
+        unwinding, and are deliberately shorter than forward ones because
+        nothing but a bumper looks backwards."""
+        u = self._uturn
+        turned = self._odo_unwrapped - u['unwrap0']
+        remaining = u['target'] - turned
+        if abs(remaining) <= self.uturn_done:
+            print(self.time, 'turned around: %.0f deg in %d legs, resuming road following'
+                  % (math.degrees(abs(turned)), u['leg']))
+            self._uturn = None
+            self._enter_drive()
+            return self._adaptive_speed(dt), self._limit_tail_swing(self._drive_steering(dt))
+        if (self.time - u['start']).total_seconds() > self.uturn_timeout_sec:
+            self._abort_turn_around('timed out with %.0f deg still to go' % math.degrees(abs(remaining)))
+            return 0.0, 0.0
+        if u['leg'] > self.uturn_max_legs:
+            self._abort_turn_around('%.0f deg still to go' % math.degrees(abs(remaining)))
+            return 0.0, 0.0
+
+        travel = self._odo_travel - u['leg_start']
+        sign = u['sign']
+        if u['direction'] > 0:
+            blocked = (self.last_obstacle is not None and self.last_obstacle < self.turning_dist)
+            off_road = self.road_ahead_frac < self.uturn_min_road_frac
+            if travel >= self.uturn_leg_m or blocked or off_road:
+                u['direction'] = -1
+                u['leg'] += 1
+                u['leg_start'] = self._odo_travel
+                print(self.time, 'turn around leg %d: %.0f deg still to go, backing up (%s)'
+                      % (u['leg'], math.degrees(abs(remaining)),
+                         'obstacle %.2fm' % self.last_obstacle if blocked else
+                         ('road mask thinning ahead' if off_road else 'leg done')))
+                return 0.0, 0.0
+            return self.uturn_speed, self._limit_tail_swing(sign * self.uturn_steering)
+        if travel >= self.uturn_reverse_m:
+            u['direction'] = 1
+            u['leg'] += 1
+            u['leg_start'] = self._odo_travel
+            print(self.time, 'turn around leg %d: %.0f deg still to go, forward again'
+                  % (u['leg'], math.degrees(abs(remaining))))
+            return 0.0, 0.0
+        # counter-steer: reversing with the joint the other way keeps
+        # rotating the nose the way we want instead of undoing it
+        return -self.backup_speed, self._limit_tail_swing(-sign * self.uturn_steering)
 
     def _odom_heading_mean(self):
         """Circular mean of the odometry heading over the last ~3 m driven."""
@@ -5955,69 +6232,6 @@ class TulakObstacle(Node):
                 self.road_lost_max_retreats))
             return -self.backup_speed, self._next_retrace_steering(dt)
         return None
-
-    def _route_corridor_bias(self, dt=None):
-        """Slow additive steering bias pulling back onto the planned
-        corridor - the LOW-FREQUENCY half of the control split described
-        at route_cross_track_gain in __init__. Positive = steer left.
-
-        Sign convention, checked end to end: the router reports
-        cross_track_m > 0 when the robot is to the RIGHT of the route's
-        direction of travel, and this platform steers left for positive
-        angles (matty.py integrates heading += dist/radius with radius
-        positive for a positive joint angle), so a positive gain on a
-        positive cross-track correctly steers left, back toward the route.
-        The heading term follows the same convention.
-
-        Smoothed with an EMA on top of the router's own per-fix smoothing:
-        this term exists to move the equilibrium, not to react, and GPS
-        noise must not reach the steering as jitter."""
-        if not self.route_mode or self.route_cross_track_m is None:
-            return 0.0
-        # --- the driving tube: cross-track as a fraction of the road ---
-        # The restoring push should say "how far toward the EDGE am I",
-        # not "how many metres from a line". Measured over the 2026-09-06
-        # runs, Matty sits at the same fraction of the way to the edge on
-        # both road types it drove - 0.32 on 1.2m-half footways, 0.29 on
-        # 2.5m-half service roads - so it is centring equally well on
-        # both. But in bare metres that same quality of centring produced
-        # 3.1deg of bias on the footway and 5.7deg on the wide road: the
-        # hardest push where there is the most room, and where a push
-        # fights the robot's legitimate use of that width.
-        #
-        # Normalising by the way's own half-width fixes the ratio, then
-        # scaling back up by tube_reference_halfwidth_m keeps the gain's
-        # units and its field-tuned meaning on a path of that width - a
-        # footway is unchanged and everything wider is relaxed in
-        # proportion. 0 disables and restores bare metres.
-        # The normalisation only ever RELAXES, never amplifies - capped at
-        # 1.0. On a wide road GPS can resolve where the robot sits across
-        # it, so easing off there is free. On a NARROW one it cannot: a 1m
-        # fix error is 1.4x the entire image width of a 0.70m path, so
-        # amplifying the cross-track push as the road narrows would be
-        # turning up the gain on the noise, on exactly the paths with no
-        # room to absorb it. Narrow roads therefore get the same push as
-        # the reference width and no more, and the direction half of this
-        # term below - which a position error barely moves - does the rest.
-        cross = self.route_cross_track_m
-        if self.tube_reference_halfwidth_m > 0 and self.route_road_halfwidth_m:
-            cross *= min(1.0, self.tube_reference_halfwidth_m / self.route_road_halfwidth_m)
-        target = self.route_cross_track_gain * cross
-        # The DIRECTION half, and the reason it is not scaled by anything
-        # above: which way the mapped path runs here is a property of the
-        # map, not of where the robot is on it, so a 1-3m fix error barely
-        # moves it as long as the snap picked the right way. That makes it
-        # the only part of the route signal that stays meaningful on a
-        # path narrower than the fix error - which is the case this whole
-        # module is heading toward at Stromovka.
-        error = self._route_heading_error()
-        if error is not None:
-            target += self.route_heading_gain * error
-        target = max(-self.route_bias_max, min(self.route_bias_max, target))
-        if dt is None:
-            return target  # diagnostic call (see _gps_status_line) - no state change
-        self._route_bias += self.route_bias_alpha * (target - self._route_bias)
-        return self._route_bias
 
     def _drive_steering(self, dt=None):
         """Steering to use when NOT actively avoiding an obstacle - i.e.
@@ -6147,301 +6361,56 @@ class TulakObstacle(Node):
             repel=self._corridor_repulsion(), local_dir=local_dir,
             gps_weight=0.0, gps_steer=0.0, hint=0.0, bias=0.0,
             profile=list(self.depth_profile or []), bin_road=list(self.profile_bin_road))
-        if self.route_guidance_style == 'arrow':
-            # see route_guidance_style in __init__: the road network drives,
-            # the map only suggests a visible branch at a junction
-            hint = self._arrow_turn_hint()
-            steering = max(-self.avoid_steering, min(self.avoid_steering, local_dir + hint))
-            weight = 0.0
-            current_heading, _source = self._current_heading()
-            if (self.route_bearing_authority_max > 0 and self.route_mode and self.route_authority
-                    and self.bearing_to_target is not None and current_heading is not None
-                    and self.road_ahead_frac < self.camera_offroad_off_frac):
-                # only with no road in front of the camera at all
-                error = normalize_angle(current_heading - self.bearing_to_target)
-                limit = self.route_steer_limit or self.turn_angle
-                weight = min(self.route_authority, self.route_bearing_authority_max)
-                steering = (1 - weight) * steering + weight * max(-limit, min(limit, error))
-            self.steer_debug.update(branch='arrow', hint=hint, gps_weight=weight, target=steering,
-                                    branch_l=self.branch_road_left, branch_r=self.branch_road_right)
-            return self._rate_limit_steering(steering, dt)
-
-        current_heading, _source = self._current_heading()
-        if not self.follow_gps_target or self.bearing_to_target is None or current_heading is None:
-            # No usable heading for the aim point - but in route mode the
-            # cross-track bias only needs a POSITION, which is a separate
-            # (and much better conditioned) question than a bearing, so it
-            # still applies. This is the case where GPS has a fix but no
-            # heading source has settled yet.
-            bias = self._route_corridor_bias(dt)
-            self.steer_debug.update(branch='no_gps', bias=bias, target=local_dir + bias)
-            return self._rate_limit_steering(local_dir + bias, dt)
-
-        error = normalize_angle(current_heading - self.bearing_to_target)
-
-        if self.route_mode and self.route_guidance_mode == 'corridor':
-            # --- corridor mode: the route is a BIAS, not a competitor ---
-            # Blending here would let the mask cancel the only restoring
-            # signal there is (see route_cross_track_gain in __init__ for
-            # the measurement). Adding cannot be cancelled - it moves the
-            # equilibrium the mask settles into, while leaving the mask in
-            # full charge of the fast corrections it is genuinely good at.
-            # The bias must never out-argue the depth. _edge_bin_correction
-            # is the "something is close on that flank" signal, and it is
-            # geometric - it does not hallucinate and it does not depend on
-            # GPS. Measured over the 2026-09-05 runs, the corridor bias
-            # pulled against the more-open side in 5.9% of cycles with both
-            # signals strong (bins differing >0.5m while cross-track >1.5m),
-            # which at +-15deg of bias is easily enough to cancel the
-            # avoidance nudge - the reported "GPS overwrites the bins".
-            #
-            # So the bias yields in proportion to how hard the edge term is
-            # already pushing. At a full-strength edge correction the route
-            # says nothing at all; on an open path it is unaffected. This
-            # keeps the documented priority order (local geometry beats the
-            # map) in the one place the additive form could break it.
-            bias = self._route_corridor_bias(dt)
-            edge = self._edge_bin_correction()
-            urgency = 0.0
-            if self.edge_correction_max_rad > 0:
-                urgency = min(1.0, abs(edge) / self.edge_correction_max_rad)
-            # The same reasoning as the depth fade above, applied to the
-            # yield itself: off the corridor, a non-urgent edge call is
-            # not a reason to stop steering back onto the road.
-            urgency = max(0.0, min(1.0, urgency - offroad))
-            if edge * bias < 0:
-                # ...and ONLY when the two actually disagree. The yield
-                # exists so local geometry can override the map, which is
-                # a question that does not arise when both push the same
-                # way - and cutting the restoring force there was pure
-                # loss. Measured over the 2026-09-05 runs, the edge term
-                # and the bias were both above 3deg on 3142 cycles and
-                # disagreed on 77% of them, near-cancelling on 40%; while
-                # more than 1.5m off the corridor the edge term pointed
-                # further off it three times as often as back toward it,
-                # because once the robot is on the verge the thing on its
-                # flank IS the road edge it should be crossing back over.
-                steering = local_dir + (1.0 - urgency) * bias
-            else:
-                steering = local_dir + bias
-            limit = self.route_steer_limit or self.turn_angle
-            # The router publishes a cruise authority for corridor mode
-            # and this branch used to throw it away, steering on the
-            # additive bias alone. That was survivable only because a
-            # separate bug was compensating for it: half the route was
-            # being classified as "junction" (see Route.junction_turn),
-            # and junction mode DOES blend the aim point, at 0.80. Fixing
-            # that classification removed the compensation, and measured
-            # paired against the old behaviour the on-road restoring
-            # command fell from +0.82 to +0.24 deg at 0.3-0.8m off-centre
-            # and from +0.21 to -0.39 deg at 0.8-1.5m. At Robotour that
-            # trade is the wrong way round: a faster robot that holds the
-            # road less well is a worse robot, because leaving the road
-            # ends the run.
-            #
-            # So the authority is now used where it was always meant to
-            # be, deliberately and everywhere, instead of arriving by
-            # accident at forks. corridor_aim_frac keeps it well under the
-            # junction figure - the mask still centres better than a 1-3m
-            # fix on a straight path, which is the whole reason
-            # cruise_authority is lower than junction_authority - while
-            # the additive bias continues to do what blending alone
-            # cannot: move the equilibrium the mask settles into.
-            if self.route_authority is not None and self.corridor_aim_frac > 0:
-                w = min(1.0, self.route_authority * self.corridor_aim_frac)
-                steering = (1 - w) * steering + w * max(-limit, min(limit, error))
-            steering = max(-limit, min(limit, steering))
-            # --- off the mapped way: the map takes over, not the mask ---
-            # A bias capped at route_bias_max is the right size for
-            # holding a lane. It is not the right size for getting back
-            # onto one, and the 2026-09-05 runs show why the difference
-            # matters: while more than 1.5m off the corridor the finished
-            # command steered back at a net 2.2deg per cycle, which at
-            # 0.4m/s takes about 160s to recover 2.5m - the reported
-            # "drove parallel to the road on the grass for a very long
-            # time". Some of that restoring force was not even the bias:
-            # it came from the router classifying half the route as
-            # "junction" and handing the aim point 0.85 authority, which
-            # is a side effect of a different bug (see
-            # Route.junction_turn) and disappears once that is fixed.
-            #
-            # So say it directly instead. Past mask_trust_cross_full_m the
-            # aim point - a real point on a mapped way, a few metres ahead
-            # - is blended in with weight proportional to how far off the
-            # robot is, reaching route_offroad_authority at
-            # mask_trust_cross_none_m. This is the competition
-            # requirement in one line: a path that looks drivable but is
-            # not on the map must not be able to out-vote the map.
-            #
-            # It cannot run away with the robot. It is still clipped to
-            # route_steer_limit (the cruising ceiling), still rate
-            # limited, still entirely subordinate to the avoidance state
-            # machine, which runs above _drive_steering and does not call
-            # it at all while a maneuver is active. 0 disables.
-            if offroad > 0 and self.route_offroad_authority > 0:
-                w = offroad * self.route_offroad_authority
-                steering = (1 - w) * steering + w * max(-limit, min(limit, error))
-            self.steer_debug.update(branch='corridor', bias=bias, target=steering)
-            return self._rate_limit_steering(steering, dt)
-
-        # --- junction / recovery: the route takes over ---
-        # A fork needs a decisive turn, not a nudge: at the cruising 20deg
-        # ceiling Matty's turning radius is 0.91m and a 90deg turn swings
-        # wide across the corner; the router raises the ceiling toward
-        # 40deg (radius 0.44m) approaching a planned junction, and relaxes
-        # the rate limit so it can actually be reached inside the junction.
-        steer_limit = self.route_steer_limit if self.route_mode and self.route_steer_limit \
-            else self.turn_angle
-        # The aim-point bearing does NOT survive the GPS bias either: at
-        # the cruising 8m lookahead a 3m lateral offset is 21deg of false
-        # bearing, which is most of a junction turn pointed at nothing.
-        # Where the route's own turn geometry is available it is used
-        # instead, because it is a property of the polyline; the bearing
-        # remains only as the fallback for a route that cannot supply one.
-        if self.route_turn_hint_max > 0 and self.route_turn_dir is not None:
-            # ADDITIVE, like corridor mode - not blended by route_authority.
-            # Blending made sense for an aim-point bearing that carried
-            # position; the hint carries only direction, and at 0.85
-            # authority a hint that has correctly gone to zero would still
-            # silence 85% of the road mask and depth steering. Close
-            # geometry still takes it back, and a mask that sees no road at
-            # all that way still vetoes most of it.
-            hint = self._route_turn_hint() * self.junction_hint_gain
-            if self.edge_correction_max_rad > 0 and self.junction_edge_yield > 0:
-                urgency = min(1.0, abs(self._edge_bin_correction()) / self.edge_correction_max_rad)
-                hint *= 1.0 - self.junction_edge_yield * urgency
-            road_frac_that_way = self.left_road_frac if hint > 0 else self.right_road_frac
-            if road_frac_that_way < self.route_min_road_frac:
-                hint *= self.route_veto_authority
-            self.steer_debug.update(branch='hint', hint=hint,
-                                    target=max(-steer_limit, min(steer_limit, local_dir + hint)))
-            return self._rate_limit_steering(max(-steer_limit, min(steer_limit, local_dir + hint)), dt)
-        bearing_steering = max(-steer_limit, min(steer_limit, error))
-
-        if self.route_mode and self.route_authority is not None:
-            # The router decides how much the bearing is worth right now -
-            # low on a straight path (the mask centres better than a 1-3m
-            # GPS fix), high at a junction (the mask has no opinion about
-            # which branch leads to the target) and while recovering from
-            # a confirmed excursion. See osm_router.py's "division of
-            # labour" section.
-            #
-            # This REPLACES the road-fraction gate rather than combining
-            # with it, and that is the deliberate part. That gate exists
-            # to stop the robot chasing a bearing off the road - a real
-            # risk when the bearing points at a destination 200m away
-            # across a lawn. In route mode the bearing points a few meters
-            # ahead along a mapped path, so the thing the gate protects
-            # against is already gone - while its side effect, refusing to
-            # turn toward a branch that is momentarily at the edge of the
-            # mask, would break exactly the junction case this is for.
-            weight = self.route_authority
-            # ...with one veto kept. If the mask sees essentially NO
-            # drivable surface the way the route wants to turn, do not
-            # commit a hard junction turn into it: that is what a bad fix,
-            # a mis-mapped branch or the wrong junction entirely looks
-            # like. A threshold this low (route_min_road_frac, 0.02
-            # against a typical 0.20-0.31 healthy fraction) only fires on
-            # "there is nothing there at all", not on "the branch is at
-            # the edge of the frame", which is why it can coexist with
-            # dropping the proportional gate above.
-            # positive steering is LEFT, same convention as the legacy
-            # branch below - keep the two reading identically
-            road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
-            if road_frac_that_way < self.route_min_road_frac:
-                weight = min(weight, self.route_veto_authority)
-            # ...and the same yield to close geometry that corridor mode
-            # has had all along. This branch had only the mask-based veto
-            # above, which is worth nothing exactly when it is needed: at
-            # a junction the robot is usually well off the road axis, so
-            # mask_trust is at its 0.25 floor and the mask is the signal
-            # already known to be unreliable there.
-            #
-            # Field case, 2026-09-06 run 115237 t=425-427: the route
-            # commanded a 35deg left turn at authority 0.85 with
-            # mask_trust 0.25; the left zone collapsed 4.16 -> 2.94 ->
-            # 0.76m and _edge_bin_correction went to its full -35deg, but
-            # at 0.85 authority the depth kept only 15% of the vote -
-            # about -2.6deg against +34deg of route - and the front
-            # bumper hit 0.8s later. That is the reported "one of these
-            # turns resulted in a crash".
-            #
-            # The priority order this file documents is that local
-            # geometry beats the map. It was being enforced in one branch
-            # and not the other.
-            if self.edge_correction_max_rad > 0 and self.junction_edge_yield > 0:
-                urgency = min(1.0, abs(self._edge_bin_correction()) / self.edge_correction_max_rad)
-                weight *= 1.0 - self.junction_edge_yield * urgency
-        elif self.bearing_blend_road_frac > 0:
-            road_frac_that_way = self.left_road_frac if bearing_steering > 0 else self.right_road_frac
-            weight = min(1.0, road_frac_that_way / self.bearing_blend_road_frac)
-        else:
-            weight = 1.0
-        weight *= self._bearing_distance_scale()  # fade out approaching the target - see item 16
-        steering = (1 - weight) * local_dir + weight * bearing_steering
-        # The corridor bias is not a corridor-MODE feature. It used to be
-        # computed only in the branch above, so for the 52% of forward
-        # driving the router classified as "junction" the one signal that
-        # knows the robot has drifted off the mapped way contributed
-        # nothing at all - and _route_bias sat frozen at whatever value it
-        # held when the mode last changed. Added here at (1 - weight) so
-        # it cannot argue with the junction aim point, which is the
-        # stronger and better-conditioned signal exactly when authority
-        # is high.
-        bias = self._route_corridor_bias(dt)
-        self.steer_debug.update(branch='bearing', gps_weight=weight, gps_steer=bearing_steering,
-                                bias=bias, target=steering + (1 - weight) * bias)
-        return self._rate_limit_steering(steering + (1 - weight) * bias, dt)
+        # The road mask drives. The map only says "there is a turn here,
+        # and it goes that way" and the arrow steers toward road actually
+        # visible on that side - see _arrow_turn_hint.
+        #
+        # What used to follow this, and why it is gone: a second, older
+        # guidance path that steered by the BEARING to an aim point, blended
+        # against the mask by the router's authority, plus a slow cross-track
+        # bias and an open-loop turn hint. route_guidance_style has selected
+        # 'arrow' since 2026-09-12 and every measurement since has been taken
+        # with it, so that path had been dead code carrying eleven settings
+        # (follow_gps_target, route_cross_track_gain_deg_per_m,
+        # route_heading_gain, route_bias_max_deg, route_bias_alpha,
+        # corridor_aim_frac, junction_hint_gain, route_min_road_frac,
+        # route_veto_authority, route_bearing_authority_max,
+        # bearing_blend_road_frac) that could no longer change anything.
+        hint = self._arrow_turn_hint()
+        steering = max(-self.avoid_steering, min(self.avoid_steering, local_dir + hint))
+        self.steer_debug.update(branch='arrow', hint=hint, gps_weight=0.0, target=steering,
+                                branch_l=self.branch_road_left, branch_r=self.branch_road_right)
+        return self._rate_limit_steering(steering, dt)
 
     def _following_status(self):
-        """Human-readable reason why GPS bearing-following is or isn't
-        currently steering the robot - logging only, mirrors the guard
-        clauses in _drive_steering()."""
-        if self.route_mode:
-            # in route mode the target is the router's rolling aim point,
-            # so "no target" here means the router has nothing to follow -
-            # which is normal before the start QR - and its own state is
-            # the informative thing to report, not this file's
-            parts = ['osm-route:%s' % self.route_state]
-            if self.route_guidance_mode:
-                parts.append(self.route_guidance_mode)
-            if self.route_authority is not None:
-                parts.append('authority=%.2f' % self.route_authority)
-            herr = self._route_heading_error()
-            if herr is not None:
-                parts.append('road_axis_err=%+.0fdeg mask_trust=%.2f'
-                              % (math.degrees(herr), self._mask_trust()))
-            if self.route_guidance_mode == 'corridor':
-                parts.append('bias=%+.1fdeg' % math.degrees(self._route_corridor_bias()))
-            if self.route_remaining_m is not None:
-                parts.append('remaining=%.0fm' % self.route_remaining_m)
-            if self.route_cross_track_m is not None:
-                parts.append('cross=%+.1fm' % self.route_cross_track_m)
-            if self.route_hold:
-                parts.append('HOLD=%s' % self.route_hold)
-            return ' '.join(parts)
-        if self.target_lat is None:
-            return 'no target'
-        if not self.follow_gps_target:
-            return 'disabled (follow_gps_target=False)'
-        if self.waypoint_reached:
-            return 'arrived, stopped'
-        _heading, source = self._current_heading()
-        if source == 'none':
-            return ('target set, waiting for compass calibration or GPS heading '
-                     '(need >=%.1fm of movement)' % self.gps_heading_min_baseline_m)
-        # near-target bearing fade (item 16) - only appended when it's
-        # actually pulling weight down, so the common case (far from the
-        # target) doesn't clutter every status line with "fade=100%"
-        fade = self._bearing_distance_scale()
-        fade_note = '' if fade >= 0.999 else ', bearing fading %.0f%% (near target)' % (fade * 100)
-        if source == 'compass':
-            if self.compass_last_calibrated is not None:
-                age_sec = (self.time - self.compass_last_calibrated).total_seconds()
-                return 'following (compass, offset=%.1fdeg, calibrated %.0fs ago)%s' % (
-                    math.degrees(self.compass_offset), age_sec, fade_note)
-            return 'following (compass)%s' % fade_note
-        return 'following (GPS fix-differencing, compass not yet calibrated)%s' % fade_note
+        """Human-readable reason why the route is or is not steering the
+        robot right now - logging only."""
+        if not self.route_mode:
+            return 'no route'
+        # The target is the router's rolling aim point, so its own state is
+        # the informative thing to report, not this file's.
+        parts = ['osm-route:%s' % self.route_state]
+        if self.route_guidance_mode:
+            parts.append(self.route_guidance_mode)
+        if self.route_authority is not None:
+            parts.append('authority=%.2f' % self.route_authority)
+        herr = self._route_heading_error()
+        if herr is not None:
+            parts.append('road_axis_err=%+.0fdeg mask_trust=%.2f'
+                          % (math.degrees(herr), self._mask_trust()))
+        if self.route_remaining_m is not None:
+            parts.append('remaining=%.0fm' % self.route_remaining_m)
+        if self.route_cross_track_m is not None:
+            parts.append('cross=%+.1fm' % self.route_cross_track_m)
+        if self.route_off_road_m is not None:
+            parts.append('off_road=%.1fm' % self.route_off_road_m)
+        if self._arrow is not None:
+            parts.append('ARROW %.0fm to go' % max(0.0, self._arrow.get('est') or 0.0))
+        if self.state is State.TURN_AROUND:
+            parts.append('TURNING AROUND')
+        if self.route_hold:
+            parts.append('HOLD=%s' % self.route_hold)
+        return ' '.join(parts)
 
     def _gps_status_line(self, lat, lon):
         """One-line summary of everything on_qr_code/on_nmea_data know
@@ -6917,6 +6886,13 @@ class TulakObstacle(Node):
         # CENTRALIZED SAFETY CHECK: If an emergency stop occurs during an active maneuver,
         # instantly abort the current state and switch to backing up.
         is_emergency = self.avoid_obstacles and self.stop_streak >= self.stop_confirm_frames
+        if is_emergency and self.state == State.TURN_AROUND:
+            # The about-turn already reverses when something comes inside
+            # turning_dist; reaching stop_dist means that was not enough
+            # room. Hand it back to the avoidance state machine, which is
+            # the thing that knows how to get out of a corner, and do not
+            # try again for uturn_retry_sec.
+            self._abort_turn_around('something inside stop_dist (%s m)' % _fmt(self.last_obstacle))
         if is_emergency and self.state in (State.TURNING, State.REALIGNING):
             print(self.time, 'Emergency stop during maneuver! Aborting to backup.')
             # This abort path bypasses BOTH stuck detectors - see
@@ -6964,7 +6940,10 @@ class TulakObstacle(Node):
             self._enter_backing_up(steer)
 
         # --- STATE MACHINE ---
-        if self.avoid_obstacles and self.state == State.BACKING_UP:
+        if self.state == State.TURN_AROUND:
+            speed, steering_angle = self._turn_around_command(dt)
+
+        elif self.avoid_obstacles and self.state == State.BACKING_UP:
             speed, steering_angle = -self.backup_speed, self._next_retrace_steering(dt)
             elapsed = self.time - self.state_start_time
             boost = self.escape_backup_time_boost if self.in_escape_mode else 1.0
@@ -7144,6 +7123,14 @@ class TulakObstacle(Node):
 
         elif self.waypoint_reached:
             speed, steering_angle = 0, 0
+
+        elif self._should_turn_around():
+            # Only ever entered from plain driving, with nothing close and
+            # the road mask healthy - see _should_turn_around. Everything
+            # above this line keeps priority, so an obstacle, a bumper, a
+            # blind camera or a hold all still pre-empt it.
+            self._enter_turn_around()
+            speed, steering_angle = self._turn_around_command(dt)
 
         else:
             speed = self._adaptive_speed(dt)

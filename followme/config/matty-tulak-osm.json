@@ -22,7 +22,8 @@
           "joint_angle"
         ],
         "out": [
-          "desired_steering"
+          "desired_steering",
+          "road_axis"
         ],
         "init": {
           "max_speed": 0.5,
@@ -44,7 +45,6 @@
           "enable_ground_hazard": false,
           "ground_hazard_confirm_frames": 3,
           "terminate_on_ground_hazard": false,
-          "follow_gps_target": true,
           "gps_heading_min_baseline_m": 5.0,
           "use_gps_course": true,
           "gps_course_min_speed": 0.2,
@@ -59,7 +59,6 @@
           "compass_learn_offset": false,
           "compass_offset_deg": 7.0,
           "waypoint_arrival_dist_m": 3.0,
-          "bearing_blend_road_frac": 0.3,
           "bearing_near_target_dist_m": 15.0,
           "gps_log_interval_sec": 2.0,
           "retrace_buffer_sec": 12.0,
@@ -117,15 +116,9 @@
           "blind_creep_speed": 0.15,
           "blind_creep_max_dist_m": 0.5,
           "route_hold_creep_speed": 0.0,
-          "route_cross_track_gain_deg_per_m": 0.0,
-          "route_heading_gain": 0.0,
-          "route_bias_max_deg": 25.0,
-          "route_bias_alpha": 0.15,
           "mask_trust_full_deg": 180.0,
           "mask_trust_none_deg": 181.0,
           "mask_trust_min": 0.25,
-          "route_min_road_frac": 0.02,
-          "route_veto_authority": 0.3,
           "compass_hardiron_deg": 10.3,
           "compass_hardiron_phase_deg": 9.0,
           "tail_swing_enabled": true,
@@ -152,7 +145,6 @@
           "ground_near_confirm_frames": 2,
           "mask_trust_cross_full_m": 0.0,
           "mask_trust_cross_none_m": 3.0,
-          "route_offroad_authority": 0.0,
           "offroad_full_m": 0.3,
           "offroad_none_m": 1.2,
           "offroad_speed": 0.35,
@@ -161,11 +153,8 @@
           "outward_damp_full_m": 1.5,
           "outward_damp_max": 0.8,
           "turn_road_side_min_cross_m": 0.0,
-          "corridor_aim_frac": 0.0,
-          "junction_edge_yield": 0.8,
           "realign_speed_factor": 0.6,
           "corridor_hold_frames": 3,
-          "tube_reference_halfwidth_m": 1.2,
           "route_turn_hint_max_deg": 10.0,
           "route_turn_hint_lead_m": 12.0,
           "route_turn_hint_full_angle_deg": 45.0,
@@ -182,7 +171,6 @@
           "turn_clearance_comfort_m": 2.0,
           "turn_side_min_road_frac": 0.05,
           "turn_side_road_frac_margin": 0.1,
-          "route_turn_closed_loop": true,
           "ground_hazard_retreat": false,
           "mask_center_alpha": 0.4,
           "mask_hold_sec": 0.6,
@@ -208,8 +196,6 @@
             0.5,
             0.8
           ],
-          "route_guidance_style": "arrow",
-          "route_bearing_authority_max": 0.0,
           "route_turn_max_turn_deg": 165,
           "route_turn_branch_min_frac": 0.05,
           "route_turn_branch_full_frac": 0.2,
@@ -261,7 +247,21 @@
           "route_turn_arm_max_mismatch_deg": 90.0,
           "route_turn_blind_min_turn_deg": 100.0,
           "road_hold_retry_sec": 5.0,
-          "road_hold_max_retries": 1000
+          "road_hold_max_retries": 1000,
+          "publish_road_axis": true,
+          "turn_around_enabled": true,
+          "uturn_min_turn_deg": 110.0,
+          "uturn_min_room_m": 0.8,
+          "uturn_speed": 0.15,
+          "uturn_steering_deg": 45.0,
+          "uturn_leg_m": 1.5,
+          "uturn_reverse_m": 0.8,
+          "uturn_max_legs": 8,
+          "uturn_done_deg": 25.0,
+          "uturn_min_road_frac": 0.2,
+          "uturn_confirm_sec": 2.0,
+          "uturn_retry_sec": 30.0,
+          "uturn_timeout_sec": 90.0
         }
       },
       "osm_router": {
@@ -271,7 +271,8 @@
           "qr_code",
           "pose2d",
           "rotation",
-          "emergency_stop"
+          "emergency_stop",
+          "road_axis"
         ],
         "out": [
           "route_hint",
@@ -353,7 +354,13 @@
           "boundary_osm": "maps/robotour2026-ver1.osm",
           "boundary_min_ways": 5,
           "replan_max_snap_m": 8.0,
-          "boundary_margin_m": 1000.0
+          "boundary_margin_m": 1000.0,
+          "map_fusion": true,
+          "fusion_gain": 0.05,
+          "fusion_max_correction_m": 3.0,
+          "fusion_align_deg": 25.0,
+          "fusion_max_residual_m": 3.0,
+          "arrival_max_gap_m": 6.0
         }
       },
       "platform": {
@@ -653,6 +660,10 @@
       [
         "app.missed_turn",
         "osm_router.missed_turn"
+      ],
+      [
+        "app.road_axis",
+        "osm_router.road_axis"
       ],
       [
         "osm_router.route_hint",
