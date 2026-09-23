@@ -1275,6 +1275,12 @@ class OSMRouter(Node):
         self.gps_search_back_m = config.get('gps_search_back_m', 12.0)
         self.gps_search_fwd_m = config.get('gps_search_fwd_m', 18.0)
         self.max_odometry_step_m = config.get('max_odometry_step_m', 0.5)
+        # Matty's wheel odometry over-reads distance by ~4.5% - measured on
+        # 17k GPS chords across three sessions, see tulak_obstacle's
+        # odometry_scale. Here it only moves `s` between fixes (the GPS snap
+        # pulls it back every second, so a second of drift is 2 cm), but the
+        # two files must agree or their countdowns diverge.
+        self.odometry_scale = config.get('odometry_scale', 0.955)
 
         # --- planning ---
         self.arrival_dist_m = config.get('arrival_dist_m', 3.0)
@@ -1357,15 +1363,15 @@ class OSMRouter(Node):
         if config.get('map_fusion', True):
             from map_fusion import MapFusion
             self.map_fusion = MapFusion(
-                gain=config.get('fusion_gain', 0.05),
                 max_correction_m=config.get('fusion_max_correction_m', 3.0),
                 align_deg=config.get('fusion_align_deg', 25.0),
                 max_residual_m=config.get('fusion_max_residual_m', 3.0),
                 looks_m=config.get('fusion_looks_m', [3.0, 5.0, 7.0]),
                 min_rings=config.get('fusion_min_rings', 8),
                 min_mask_frac=config.get('fusion_min_mask_frac', 0.25),
-                decay_per_update=config.get('fusion_decay_per_update', 0.001),
-                max_step_m=config.get('fusion_max_step_m', 0.05))
+                half_life_s=config.get('fusion_half_life_sec', 8.0),
+                ridge=config.get('fusion_ridge', 4.0),
+                max_slew_m_s=config.get('fusion_max_slew_m_s', 1.0))
         # how stale a road_axis may be when a fix arrives
         self.fusion_axis_max_age = config.get('fusion_axis_max_age_sec', 0.7)
         # how far the fix may be from the end of the route and still count
@@ -1742,7 +1748,7 @@ class OSMRouter(Node):
             # odometry frame is rotated relative to the map. Reversing
             # therefore moves `s` backwards, which is what we want during
             # an avoidance backup.
-            step = dx * math.cos(pose[2]) + dy * math.sin(pose[2])
+            step = self.odometry_scale * (dx * math.cos(pose[2]) + dy * math.sin(pose[2]))
             step = max(-self.max_odometry_step_m, min(self.max_odometry_step_m, step))
             self.s = max(0.0, min(self.route.total, self.s + step))
         self._prev_pose = pose
@@ -2490,6 +2496,16 @@ class OSMRouter(Node):
         # at its 3 m ceiling is worth seeing in the field, because it means
         # either a badly biased fix or a road the map does not have.
         hint['fusion_m'] = None if self.map_fusion is None else round(self.map_fusion.magnitude, 2)
+        # How well the along-track position is known right now. It is large
+        # on a long straight, because nothing in the picture observes it
+        # there, and it comes back down after a corner. Published so the
+        # follower's turn logic can be told what the countdown is worth -
+        # see map_fusion for why this is a different question from the
+        # sideways correction.
+        hint['along_sigma_m'] = None
+        if self.map_fusion is not None:
+            sigma = self.map_fusion.sigma_along(self._compass_bearing())
+            hint['along_sigma_m'] = None if sigma == float('inf') else round(sigma, 2)
         # How wide the surface under the robot is - published so the
         # follower can express cross-track as a fraction of the way to the
         # road EDGE rather than in bare metres. See _route_corridor_bias.

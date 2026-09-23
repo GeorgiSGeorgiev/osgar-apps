@@ -136,6 +136,13 @@ def test_fusion_converges():
     check(abs(f.corr[0] - 2.0) < 0.2 and abs(f.corr[1]) < 0.2,
           'a 2 m sideways map error is learned (%.2f, %.2f)' % tuple(f.corr))
     check(f.accepted > 300, 'from %d accepted observations' % f.accepted)
+    # the road runs north, so nothing here observes the north component -
+    # the ridge must hold it at zero rather than let it wander
+    check(abs(f.corr[1]) < 0.05,
+          'and the unobserved along-track component stays at zero (%.3f m)' % f.corr[1])
+    check(f.sigma_along(0.0) > 3 * f.sigma_along(math.pi / 2),
+          'which it also reports: along %.2f m against across %.2f m'
+          % (f.sigma_along(0.0), f.sigma_along(math.pi / 2)))
 
     f = MapFusion(max_correction_m=1.0)
     for _ in range(400):

@@ -25,7 +25,6 @@
     camera point   C(L) = p + L*u + y_cam(L)*n_robot
     map point      M(L) = the nearest point of the nearest way to p + L*u
     residual       r(L) = (C(L) - M(L)) . n_way(L)
-    update         corr -= gain * r(L) * n_way(L)
 
   Matching along the WAY's normal rather than the robot's is what makes
   this safe on a straight road: there, every normal points the same way, so
@@ -35,6 +34,75 @@
   component becomes observable on its own merits. No curvature has to be
   estimated and nothing has to decide whether the road is straight.
 
+  --- Sideways and along-track are different problems ---
+
+  Sideways is observed every frame. Along-track is observed only when the
+  road turns, and the difference is not a matter of tuning:
+
+    A road looks the same at s and at s+10 on a straight. Nothing in the
+    picture distinguishes them, so no filter - Kalman, particle or
+    otherwise - can recover the along-track position from the road alone.
+    A filter can only decide what to do with the absence of information.
+
+  Three candidate landmarks were measured on 89 logs and all three failed
+  or were shown to be unnecessary:
+
+    junctions seen by the camera  do not range. Approaching one, a real
+      ground feature comes nearer at one metre per metre driven. Cross-
+      correlating the road's side extent at the 3m ring against the 7m ring
+      in the odometry-travel domain, over 350 log/side pairs at four sites,
+      the peak lag is 0.00 m every time, where a ground feature would give
+      4.0 m. What the mask calls "the road opens up" happens at every look-
+      ahead at once: it is the robot entering the open area, not an opening
+      approaching. See scratchpad/ringtest.py and drift2.py.
+
+    the physical turn as a landmark  is real but far too rare: 1-3 turns of
+      35 degrees or more per run, so the anchor would be 50-150 m old.
+
+    dead reckoning from an anchor  is only competitive very locally. Held
+      out against the GPS, the along-track error after dead reckoning is
+      0.6 m at 10 m, 1.0 m at 25 m, 2.1 m at 50 m - i.e. worse than the
+      GPS itself beyond about 30 m, and there is no anchor to start from.
+
+  What DOES work is that the error is ONE 2-D VECTOR. Held out on 13 583
+  points in 179 folds across four sites, fitting a single vector to the
+  measurements taken on roads of one orientation predicts the measurement
+  on roads 40 degrees away with a median residual of 0.48 m against 1.13 m
+  uncorrected - 57% of the cross-heading error explained by one shared
+  vector. So the along-track component IS recoverable, but only after the
+  robot has recently driven something at an angle, and only as well as that
+  geometry allows.
+
+  --- Why recursive least squares and not a gradient step ---
+
+  That is what the information matrix is for. Each accepted look-ahead
+  gives one linear equation n.c = y in the two components of the
+  correction; accumulating
+
+      A <- f*A + n n^T ,   b <- f*b + n y ,   c = (A + ridge*I)^-1 b
+
+  remembers WHICH DIRECTIONS it has been told about. On a straight road A
+  is rank one and the ridge holds the unobserved component at zero; at a
+  corner the new normal fills in the missing rank and the along-track
+  component is solved for at once, from everything in the remembered
+  window, instead of being crawled toward at 5 cm a frame.
+
+  The difference is not academic. Scored causally - every observation
+  judged against the correction held BEFORE it was used - at the first
+  moment a fresh heading exposes the along-track component:
+
+      no correction at all      1.39 m
+      scalar gradient step      1.59 m     WORSE than doing nothing
+      this filter               1.09 m
+
+  The gradient step is worse than nothing there because its along-track
+  component is a random walk: it is driven by whatever the sideways
+  residuals happened to be, and points nowhere in particular.
+
+  Sideways, over the same runs, the gradient step scores 0.51 m and this
+  filter 0.56 m against 2.66 m uncorrected - a tenth of the sideways
+  benefit traded for a third off the along-track error.
+
   --- Why it does not drive the robot onto the grass ---
 
   It cannot steer. It moves where the robot THINKS it is by at most
@@ -43,7 +111,7 @@
 
   What it could do is talk the router out of noticing a genuine excursion
   ("the camera sees a road, so we must be on one") - and a road mask on a
-  lawn does look like a road. Four gates stop that, all of them needed:
+  lawn does look like a road. Five gates stop that, all of them needed:
 
     alignment  the mapped way must run within align_deg of the road the
         camera sees. In run 080142 at t=430-480s Matty drove off the
@@ -56,9 +124,11 @@
     magnitude  the accumulated correction is capped at max_correction_m
         (3m). Paths in a park are further apart than that, so the cap is
         also what stops the estimate walking onto the neighbouring path.
-    decay      with no accepted observation the correction bleeds back
-        toward zero with a ~100s time constant, so a correction learned
-        from a mistake does not outlive the mistake.
+    ridge      an unobserved direction is held at zero rather than left
+        free. This is the along-track safety property above.
+    forgetting with no accepted observation the information decays with a
+        half-life of half_life_s, so a correction learned from a mistake
+        does not outlive the mistake.
 
   --- Scored, out of sample ---
 
@@ -67,29 +137,16 @@
   not a fit. Gap between the road the camera sees and the road the map
   draws, median over the whole set:
 
-      competition day  2.07m -> 0.43m     (n=10261 observations)
+      competition day  2.16m -> 0.40m     (n=13054 observations)
       Stromovka 09-17  3.18m -> 0.65m     (n=14326)
+      Stromovka 09-12  1.32m -> 0.33m     (n=15757)
       Suchdol 09-18    1.19m -> 0.35m     (n=14815)
 
   and the map's own "how far off the road is the robot" at those moments:
 
-      competition day  median 0.48 -> 0.00, p90 3.78 -> 1.01, mean 1.09 -> 0.23
+      competition day  median 0.51 -> 0.00, p90 3.44 -> 0.77, mean 1.04 -> 0.19
       Stromovka 09-17  median 1.66 -> 0.00, p90 3.27 -> 0.63, mean 1.67 -> 0.19
       Suchdol 09-18    median 0.00 -> 0.00, p90 1.29 -> 0.00, mean 0.37 -> 0.04
-
-  --- What is deliberately NOT here ---
-
-  Correcting the along-track position from junctions the camera sees. The
-  camera's branch sightings do sit closer than the map's junctions by a
-  consistent 2.9m (comp) / 3.3m (Stromovka) median, which is the right
-  sign for the missed turns - but the spread is 4.1-4.4m, and scored
-  against the only unarguable ground truth available (the moment Matty
-  physically turns 40+ deg) neither instrument wins: the map's nearest
-  junction is a median 6.2m out and the camera's branch 6.8m, on 21
-  events. That is not enough to move the robot's position with, so it is
-  not used for that. See tulak_obstacle's arrow logic for the branch
-  sighting used as a turn TRIGGER instead, which risks nothing but the
-  timing of a turn the map already asked for.
 """
 import math
 
@@ -99,11 +156,11 @@ import numpy as np
 class MapFusion:
     """Estimates one correction vector (east, north) in metres."""
 
-    def __init__(self, gain=0.05, max_correction_m=3.0, align_deg=25.0,
-                 max_residual_m=3.0, looks_m=(3.0, 5.0, 7.0), min_rings=8,
-                 min_mask_frac=0.25, min_halfwidth_m=0.4, max_halfwidth_m=4.0,
-                 decay_per_update=0.001, max_step_m=0.05, max_snap_m=10.0):
-        self.gain = gain
+    def __init__(self, max_correction_m=3.0, align_deg=25.0, max_residual_m=3.0,
+                 looks_m=(3.0, 5.0, 7.0), min_rings=8, min_mask_frac=0.25,
+                 min_halfwidth_m=0.4, max_halfwidth_m=4.0, half_life_s=8.0,
+                 rate_hz=8.0, ridge=4.0, max_slew_m_s=1.0, sigma_m=4.0,
+                 max_snap_m=10.0):
         self.max_correction_m = max_correction_m
         self.align = math.radians(align_deg)
         self.max_residual_m = max_residual_m
@@ -112,13 +169,30 @@ class MapFusion:
         self.min_mask_frac = min_mask_frac
         self.min_halfwidth_m = min_halfwidth_m
         self.max_halfwidth_m = max_halfwidth_m
-        self.decay_per_update = decay_per_update
-        self.max_step_m = max_step_m
         self.max_snap_m = max_snap_m
+        # Forgetting factor per update. The bias holds a direction for
+        # 30-60s, but a SHORT memory scored better: half-lives of 8, 15 and
+        # 30s gave a sideways error of 0.56, 0.62 and 0.70m for the same
+        # along-track gain, because a longer window averages a bias that is
+        # still moving.
+        self.forget = 0.5 ** (1.0 / max(1e-6, half_life_s * rate_hz))
+        self.ridge = ridge
+        self.max_slew = max_slew_m_s / max(1e-6, rate_hz)
+        # The three look-aheads of one frame, and one frame and the next,
+        # are nowhere near independent measurements, so the information
+        # matrix overstates how much is known by more than an order of
+        # magnitude. sigma_m is the empirical factor that makes the
+        # published uncertainty match the error actually observed (0.22m
+        # claimed against 1.09m measured at a fresh heading). Published for
+        # the log and for the follower to gate on; never acted on here.
+        self.sigma_m = sigma_m
         self.reset()
 
     def reset(self):
-        self.corr = np.zeros(2)
+        self.corr = np.zeros(2)         # what is applied (slew limited)
+        self.solution = np.zeros(2)     # what the information currently says
+        self.info = np.zeros((2, 2))    # sum of n n^T, with forgetting
+        self.rhs = np.zeros(2)          # sum of n y
         self.accepted = 0
         self.updates = 0
         self.last_residuals = []
@@ -136,15 +210,37 @@ class MapFusion:
     def apply(self, x, y):
         return x + float(self.corr[0]), y + float(self.corr[1])
 
+    def sigma_along(self, heading):
+        """How well the correction is known ALONG the road the robot is
+        facing, in metres. Large on a long straight, where nothing in the
+        picture observes it; small again once a corner has been driven."""
+        if heading is None:
+            return float('inf')
+        u = np.array([math.sin(heading), math.cos(heading)])
+        try:
+            m = np.linalg.inv(self.info + self.ridge * np.eye(2))
+        except np.linalg.LinAlgError:
+            return float('inf')
+        return float(self.sigma_m * math.sqrt(max(0.0, float(u @ m @ u))))
+
     # --- estimate -----------------------------------------------------
     def update(self, graph, x, y, heading, axis):
         """One fusion step at map position (x, y) with compass `heading`
         and the camera's road axis `axis` (see road_geometry.trunk):
         dict(y0, slope, half, n, frac). Returns True if it was used."""
         self.updates += 1
+        self.info *= self.forget
+        self.rhs *= self.forget
         used = self._update(graph, x, y, heading, axis)
-        if not used and self.decay_per_update > 0:
-            self.corr *= (1.0 - self.decay_per_update)
+        # Slew toward the solution rather than jumping to it. When a corner
+        # suddenly makes the along-track observable, the solution can move
+        # metres in one frame; the route the follower is being given should
+        # not.
+        delta = self.solution - self.corr
+        size = float(np.hypot(*delta))
+        if self.max_slew > 0 and size > self.max_slew:
+            delta = delta * (self.max_slew / size)
+        self.corr = self.corr + delta
         return used
 
     def _update(self, graph, x, y, heading, axis):
@@ -170,7 +266,6 @@ class MapFusion:
         u = np.array([math.sin(heading), math.cos(heading)])
         n_robot = np.array([-math.cos(heading), math.sin(heading)])
         cam_rel = math.atan(axis['slope'])
-        step = np.zeros(2)
         used = 0
         for look in self.looks_m:
             q = _snap_xy(graph, p + look * u)
@@ -186,19 +281,20 @@ class MapFusion:
             if abs(residual) > self.max_residual_m:
                 continue                                  # not a fix bias
             self.last_residuals.append((look, residual))
-            step = step - self.gain * residual * q['nrm']
+            # the residual is measured at the CORRECTED position, so
+            # n.corr - residual is a direct measurement of n.c*
+            n = q['nrm']
+            self.info += np.outer(n, n)
+            self.rhs += n * (float(n @ self.corr) - residual)
             used += 1
         if not used:
             self.last_reason = 'no look-ahead matched a mapped way'
             return False
-        step /= used
-        size = float(np.hypot(*step))
-        if self.max_step_m > 0 and size > self.max_step_m:
-            step *= self.max_step_m / size
-        self.corr = self.corr + step
-        size = float(np.hypot(*self.corr))
+        solution = np.linalg.solve(self.info + self.ridge * np.eye(2), self.rhs)
+        size = float(np.hypot(*solution))
         if size > self.max_correction_m:
-            self.corr *= self.max_correction_m / size
+            solution = solution * (self.max_correction_m / size)
+        self.solution = solution
         self.accepted += 1
         self.last_reason = 'ok'
         return True

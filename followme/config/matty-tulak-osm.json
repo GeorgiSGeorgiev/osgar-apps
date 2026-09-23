@@ -245,7 +245,11 @@
             "gps-course"
           ],
           "route_turn_arm_max_mismatch_deg": 90.0,
-          "route_turn_blind_min_turn_deg": 100.0,
+          "route_turn_blind_min_turn_deg": 25.0,
+          "route_turn_blind_max_turn_deg": 100.0,
+          "route_turn_blind_min_room_m": 1.2,
+          "route_turn_est_alpha": 0.0,
+          "route_turn_est_max_pull_m": 8.0,
           "road_hold_retry_sec": 5.0,
           "road_hold_max_retries": 1000,
           "publish_road_axis": true,
@@ -261,7 +265,9 @@
           "uturn_min_road_frac": 0.2,
           "uturn_confirm_sec": 2.0,
           "uturn_retry_sec": 30.0,
-          "uturn_timeout_sec": 90.0
+          "uturn_request_sec": 1.0,
+          "uturn_timeout_sec": 90.0,
+          "odometry_scale": 0.955
         }
       },
       "osm_router": {
@@ -356,11 +362,14 @@
           "replan_max_snap_m": 8.0,
           "boundary_margin_m": 1000.0,
           "map_fusion": true,
-          "fusion_gain": 0.05,
+          "fusion_half_life_sec": 8.0,
+          "fusion_ridge": 4.0,
+          "fusion_max_slew_m_s": 1.0,
           "fusion_max_correction_m": 3.0,
           "fusion_align_deg": 25.0,
           "fusion_max_residual_m": 3.0,
-          "arrival_max_gap_m": 6.0
+          "arrival_max_gap_m": 6.0,
+          "odometry_scale": 0.955
         }
       },
       "platform": {

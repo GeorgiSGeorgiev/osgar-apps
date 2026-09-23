@@ -1469,6 +1469,9 @@ class TulakObstacle(Node):
         self.uturn_min_road_frac = config.get('uturn_min_road_frac', 0.20)
         self.uturn_min_room_m = config.get('uturn_min_room_m', 0.8)
         self.uturn_retry_sec = config.get('uturn_retry_sec', 30.0)
+        # how long a request from _arm_odometry_turn stays valid. Short, and
+        # re-checked every cycle anyway - see _uturn_still_wanted.
+        self.uturn_request_sec = config.get('uturn_request_sec', 1.0)
         self._uturn = None
         self._uturn_wanted_since = None
         self._uturn_blocked_until = None
@@ -2483,7 +2486,34 @@ class TulakObstacle(Node):
         # is all there is; a mild one is visible, and blind steering there
         # only added GPS timing error (161640 +91 deg: behind the railing).
         # 0 = every turn, as before.
+        # Which turns the map may steer BLIND, when the camera cannot see the
+        # branch - a window, not a floor.
+        #
+        # Below the floor there is nothing to steer blind for: a 20 deg fork
+        # is the road bending, and the mask follows it. Above the ceiling the
+        # about-turn manoeuvre owns it (State.TURN_AROUND), which drives
+        # against the odometry heading and needs to see nothing - steering a
+        # 140 deg turn with an 18 deg nudge only ever walked off the edge.
+        #
+        # The floor was 100 deg on competition morning, i.e. blind steering
+        # was off for every ordinary fork, because on 2026-09-18 it put Matty
+        # on the grass twice at CZU when the junction countdown was 5 m out.
+        # That countdown is now corrected for its 16% rate error (see
+        # route_turn_est_alpha) and the fix itself is 0.5 m across the road
+        # instead of 2-3 m, which is what makes a +-3 m blind window
+        # defensible at all. Every other gate is unchanged: the camera must
+        # still see road ahead (route_turn_blind_min_ahead), the depth on
+        # that side must be clear, and the nudge is capped at
+        # route_turn_blind_deg.
         self.route_turn_blind_min_turn = math.radians(config.get('route_turn_blind_min_turn_deg', 0.0))
+        self.route_turn_blind_max_turn = math.radians(config.get('route_turn_blind_max_turn_deg', 0.0))
+        # how hard the arrow's odometry countdown is pulled back toward the
+        # router's live distance - 0 keeps the frozen-anchor behaviour
+        self.route_turn_est_alpha = config.get('route_turn_est_alpha', 0.0)
+        # how much road must still be visible on the turn side before the
+        # map may steer blind into it - see _blind_turn_hint
+        self.route_turn_blind_min_room = config.get('route_turn_blind_min_room_m', 0.0)
+        self.route_turn_est_max_pull = config.get('route_turn_est_max_pull_m', 8.0)
         # ...and only while the camera sees at least this much road straight
         # ahead, i.e. the robot is demonstrably still ON a road when it starts
         # the turn. Defaults to the off-road threshold.
@@ -2522,6 +2552,31 @@ class TulakObstacle(Node):
         self._turn_done_keys = set()
         self._turn_done_seq = None
         self._odo_fwd = 0.0                   # signed forward odometry, m (backing up counts down)
+        # Matty's wheel odometry OVER-READS DISTANCE by about 4.5%.
+        #
+        # Measured with the one ruler that has no bias in it: a GPS bias
+        # cancels in a DISPLACEMENT, because the same offset sits in both
+        # fixes, so the length of a GPS chord over tens of metres is an
+        # unbiased (if noisy) metre. Over 17k nearly-straight baselines from
+        # the 09-17, 09-18 and 09-19 sessions the GPS chord came to 0.94-0.97
+        # of the odometry chord, flat across 10, 20, 40 and 80 m baselines -
+        # flat is what says scale rather than weaving or GPS smoothing, both
+        # of which would fade with baseline. Per log the median sits at
+        # 0.94-0.96 with a spread of 0.02-0.035, at three different sites.
+        #
+        # It matters here because everything this file counts down in metres
+        # is odometry: the turn arrow's approach (route_turn_hint_lead_m,
+        # 12 m -> 0.5 m of error), the retreat and scout budgets, the
+        # about-turn's legs. Held-out dead reckoning over 25 m improves from
+        # 1.30 m to 1.04 m of along-track error with this applied.
+        #
+        # Deliberately a CONSTANT and not estimated online: the same test run
+        # with the scale re-estimated from the last 40 fixes did worse than
+        # the constant at every distance (1.73 m against 1.04 m at 25 m),
+        # because 40 s of GPS noise is a worse ruler than a number measured
+        # over three sessions. Re-measure it with scratchpad/odoscale.py if
+        # the wheels or tyres change.
+        self.odometry_scale = config.get('odometry_scale', 0.955)
         # odometry heading summed cycle by cycle, never wrapped: a 136 deg
         # hairpin plus a 45 deg drift the other way is 181 deg still to do,
         # not -179 (170349 replay t=422: the wrapped angle pulled -35 deg,
@@ -5686,6 +5741,35 @@ class TulakObstacle(Node):
             self._arrow['remaining'] = remaining
             err = -remaining
             self._arrow['est'] = self._arrow['anchor'] - self._odo_fwd
+            # ...and optionally pull it back toward what the router says NOW.
+            #
+            # MEASURED AND NOT SHIPPED (route_turn_est_alpha defaults to 0).
+            # The idea was that the frozen anchor assumes the distance to the
+            # junction shrinks one metre per metre of odometry, and it does
+            # not: over 85 approaches the router's turn_dist_m falls by only
+            # 0.865 m per metre driven, because it measures progress ALONG
+            # THE ROUTE while the robot's own path is longer - it weaves, it
+            # centres itself, it goes round things.
+            #
+            # But pulling the arrow toward that number makes it worse, not
+            # better. With the anchor frozen the arrow counts down at
+            # -0.955 per metre of raw odometry (p25 -0.956, p75 -0.954),
+            # which is exactly one metre of TRUE distance per metre, because
+            # odometry_scale is already applied. Pulling it toward the
+            # router's arclength moved it to -0.912 and widened the spread
+            # to -0.985..-0.782. The route arclength is the wrong unit for a
+            # countdown the robot drives in path metres; converting between
+            # them needs a weave factor that varies far too much to trust.
+            #
+            # Left in, off, because the measurement is worth keeping next to
+            # the thing it describes.
+            #
+            if (self.route_turn_est_alpha > 0 and self.route_turn_dist_m is not None
+                    and abs(self.route_turn_dist_m - self._arrow['est'])
+                    <= self.route_turn_est_max_pull):
+                self._arrow['est'] += self.route_turn_est_alpha * (
+                        self.route_turn_dist_m - self._arrow['est'])
+                self._arrow['anchor'] = self._arrow['est'] + self._odo_fwd
         else:
             err = normalize_angle(self._arrow['exit'] - heading)   # +: exit lies clockwise (right)
             self._arrow['est'] = self._arrow['arm_dist'] - travelled
@@ -5780,6 +5864,8 @@ class TulakObstacle(Node):
             return 0.0
         if arrow['turn'] < self.route_turn_blind_min_turn:
             return 0.0                      # mild turn - the camera can see that branch
+        if 0 < self.route_turn_blind_max_turn < arrow['turn']:
+            return 0.0                      # too far round to nudge - see _should_turn_around
         if not (-self.route_turn_blind_window_m <= arrow['est'] <= self.route_turn_near_m):
             return 0.0
         if self.road_ahead_frac < self.route_turn_blind_min_ahead:
@@ -5787,6 +5873,25 @@ class TulakObstacle(Node):
         side_dist = self.right_dist if side < 0 else self.left_dist
         if side_dist is not None and side_dist <= self.turning_dist:
             return 0.0                      # something is there - obstacle avoidance owns this
+        # ...and there has to be somewhere to go.
+        #
+        # Blind means no branch is visible, and measured over 89 logs the
+        # road fraction on the side being steered toward is a median of
+        # 0.03-0.07 at those moments: the camera sees nothing that way. That
+        # is fine at a junction and is exactly how Matty ended up on the
+        # grass twice at CZU on 2026-09-18 when it was not one. The ground
+        # projection answers the question the fraction cannot: how far away
+        # is the road EDGE on that side. Below blind_min_room_m there is no
+        # room to swing into, whatever the map believes.
+        if self.route_turn_blind_min_room > 0:
+            room = self._road_room(side)
+            if room is not None and room < self.route_turn_blind_min_room:
+                if not self._arrow.get('blind_noroom'):
+                    self._arrow['blind_noroom'] = True
+                    print(self.time, 'mapped turn %+.0f deg but only %.2f m of road on the %s - '
+                                     'not steering blind into the edge'
+                          % (math.degrees(err), room, 'left' if side > 0 else 'right'))
+                return 0.0
         return side * min(self.route_turn_blind, 0.5 * abs(err))
 
     def _announce_blind(self, blind, err):
@@ -5981,6 +6086,25 @@ class TulakObstacle(Node):
                 return False, 'only %.2f m clear on the %s' % (flank, where)
         return True, ''
 
+    def _uturn_still_wanted(self):
+        """Is the fork _arm_odometry_turn asked about still asking?
+
+        It has to be re-checked at the moment of use, not taken on trust
+        from when it was queued. In czu9 164121 the route was planned with
+        a 113 deg turn 3 m ahead, an obstacle-avoidance manoeuvre swung the
+        robot 80 deg of that within the next two seconds, and by the time
+        the request was acted on the route wanted +20 deg - it had already
+        been driven. Without this the about-turn fired and pointed a
+        perfectly good run backwards. That is the false positive the
+        manoeuvre cannot afford, and one in 89 logs is one too many."""
+        live = self._turn_around_todo()
+        if live is not None and abs(live) >= self.uturn_min_turn:
+            return True                     # the road here still runs backwards
+        rel = self.route_turn_rel if self.route_turn_rel is not None else self.route_turn_dir
+        return (rel is not None and abs(rel) >= self.uturn_min_turn
+                and self.route_turn_dist_m is not None
+                and self.route_turn_dist_m <= self.route_turn_near_m + 2.0)
+
     def _should_turn_around(self):
         """True when the route needs the robot to end up facing backwards
         and there is room to get there.
@@ -6005,9 +6129,10 @@ class TulakObstacle(Node):
             return False
         todo = None
         if self._uturn_request is not None:
-            if (self.time - self._uturn_request['at']).total_seconds() < 2.0:
+            fresh = (self.time - self._uturn_request['at']).total_seconds() < self.uturn_request_sec
+            if fresh and self._uturn_still_wanted():
                 todo = self._uturn_request['todo']
-            else:
+            elif not fresh:
                 self._uturn_request = None
         if todo is None:
             wrong_way = self._turn_around_todo()
@@ -6717,8 +6842,10 @@ class TulakObstacle(Node):
         self._odo_unwrap_prev = self._odom_heading
         if self._odo_hist_xy is not None:
             odx, ody = xy[0] - self._odo_hist_xy[0], xy[1] - self._odo_hist_xy[1]
-            self._odo_travel += math.hypot(odx, ody)
-            self._odo_fwd += odx * math.cos(self._odom_heading) + ody * math.sin(self._odom_heading)
+            k = self.odometry_scale
+            self._odo_travel += k * math.hypot(odx, ody)
+            self._odo_fwd += k * (odx * math.cos(self._odom_heading)
+                                  + ody * math.sin(self._odom_heading))
         self._odo_hist_xy = xy
         self._odo_hist.append((self._odo_travel, self._odom_heading))
         while len(self._odo_hist) > 2 and self._odo_travel - self._odo_hist[0][0] > 3.0:
