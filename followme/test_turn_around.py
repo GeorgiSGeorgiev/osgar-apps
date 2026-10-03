@@ -118,11 +118,12 @@ class Sim:
             m[row, max(0, c0):min(320, c1 + 1)] = 1
         return m
 
-    def step(self, hint=None):
+    def step(self, hint=None, camera=True):
         app = self.app
         app.time = datetime.timedelta(seconds=self.t)
-        app.on_nn_mask(self._mask())
-        app.on_obstacle_zones(self._zones())
+        if camera:                  # False = the OAK has stopped sending
+            app.on_nn_mask(self._mask())
+            app.on_obstacle_zones(self._zones())
         if hint is not None:
             app.on_route_hint(hint)
         app.on_pose2d([int(self.x * 1000), int(self.y * 1000),
@@ -251,9 +252,28 @@ def test_obstacle_aborts():
           'and something inside stop_dist takes it back to avoidance (%s)' % sim.app.state)
 
 
+def test_camera_silence_stops():
+    """150409 / 150552 (2026-09-28): the camera went quiet and Matty drove on
+    at 0.5 m/s on its last picture for ~10 s. It must hold still instead, and
+    carry on by itself when the frames come back."""
+    print('== the camera stops sending ==')
+    sim = Sim(road_halfwidth_m=1.2, app_overrides={'camera_timeout_sec': 1.0})
+    for _ in range(30):
+        _feed_gps(sim)
+        sim.step(hint_for(90.0))
+    check(sim.bus.published['desired_steering'][0] > 0, 'driving before the stall')
+    speeds = []
+    for _ in range(30):                     # 3 s without a frame
+        speeds.append(sim.step(hint_for(90.0), camera=False)[0])
+    check(max(speeds[11:]) == 0.0, 'stopped within 1.1 s of the last frame and stays stopped '
+          '(first zero command after %.1f s)' % (0.1 * next(i for i, v in enumerate(speeds) if v == 0.0)))
+    speeds = [sim.step(hint_for(90.0))[0] for _ in range(20)]
+    check(max(speeds) > 0.0, 'and drives on once frames arrive again')
+
+
 def main():
     for test in (test_completes_the_turn_080142_missed, test_completes_a_full_about_turn,
-                 test_refuses_without_room, test_obstacle_aborts):
+                 test_refuses_without_room, test_obstacle_aborts, test_camera_silence_stops):
         test()
     print('\nALL TURN-AROUND TESTS PASSED')
     return 0

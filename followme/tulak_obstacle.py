@@ -1472,6 +1472,60 @@ class TulakObstacle(Node):
         # how long a request from _arm_odometry_turn stays valid. Short, and
         # re-checked every cycle anyway - see _uturn_still_wanted.
         self.uturn_request_sec = config.get('uturn_request_sec', 1.0)
+        # A second opinion on the heading before turning around on it - see
+        # _uturn_heading_ok. 144532 t=518.6 (CZU, 2026-09-28): reflected
+        # fixes beside a housing block walked the odometry+GPS heading ~100
+        # deg off within 5 s while the wheels drove dead straight, the route
+        # "ran +137 deg from here", and Matty turned around on an empty road
+        # - with the receiver's Doppler course reading 259 deg, 7 deg from
+        # the road. uturn_cog_margin_deg: the course, carried forward by the
+        # odometry rotation since that fix, must ALSO put the route more than
+        # uturn_min_turn minus this behind the robot (0 = no course check).
+        # uturn_settle_m / uturn_settle_max_deg: no about-turn while the
+        # heading offset has moved more than this over the last metres of
+        # travel (0 = no check).
+        self.uturn_cog_margin = math.radians(config.get('uturn_cog_margin_deg', 0.0))
+        self.uturn_settle_m = config.get('uturn_settle_m', 8.0)
+        self.uturn_settle_max_deg = config.get('uturn_settle_max_deg', 0.0)
+        self._uturn_heading_note = None
+        # --- where to point on open paving (2026-09-28, CZU test10) ---
+        # On ground the mask covers edge to edge - a plaza, a parking lot, a
+        # forecourt - its centre sits in the dead zone and nothing turns the
+        # robot back once something has turned it away. 145851: dodging
+        # pedestrians swung Matty 162 -> 206 deg, the mapped road runs 177,
+        # and it held 25-29 deg off for ~23 s, 7.7 m across into a dead end.
+        # 150145: 15-35 deg off for ~40 s out of a turn, into a parking lot.
+        # Two gentle terms, only there (see _open_ground), only while depth
+        # is not steering and nothing is near, never past heading_hold_max:
+        #   heading_hold  toward the MAPPED road direction, once the gap has
+        #                 lasted heading_hold_gap_sec;
+        #   avoid_return  after an avoidance (a manoeuvre or a depth swerve),
+        #                 back to the heading the robot had just before it -
+        #                 a lane change, not a return to the old line - by
+        #                 odometry, so it needs neither GPS nor a route.
+        # Measured before shipping: on open ground in well-driven stretches
+        # the map and the heading disagree by a median 7-22 deg per site,
+        # which is why the pull is capped low and needs a lasting gap.
+        self.heading_hold_enabled = config.get('heading_hold_enabled', False)
+        self.avoid_return_enabled = config.get('avoid_return_enabled', False)
+        self.heading_hold_gain = config.get('heading_hold_gain', 0.4)
+        self.heading_hold_max = math.radians(config.get('heading_hold_max_deg', 8.0))
+        self.heading_hold_deadband = math.radians(config.get('heading_hold_deadband_deg', 6.0))
+        self.heading_hold_max_gap = math.radians(config.get('heading_hold_max_gap_deg', 45.0))
+        self.heading_hold_gap_sec = config.get('heading_hold_gap_sec', 2.0)
+        self.heading_hold_open_frac = config.get('heading_hold_open_frac', 0.6)
+        self.heading_hold_open_sec = config.get('heading_hold_open_sec', 1.0)
+        self.heading_hold_turn_clear_m = config.get('heading_hold_turn_clear_m', 12.0)
+        self.heading_hold_max_cross_m = config.get('heading_hold_max_cross_m', 4.0)
+        self.heading_hold_clear_factor = config.get('heading_hold_clear_factor', 1.5)
+        self.avoid_return_lag_sec = config.get('avoid_return_lag_sec', 1.5)
+        self.avoid_return_max_m = config.get('avoid_return_max_m', 10.0)
+        self.avoid_return_route_agree = math.radians(config.get('avoid_return_route_agree_deg', 20.0))
+        self._open_since = None
+        self._hold_gap_since = None
+        self._hold_engaged = False
+        self._odo_trail = deque()           # (time, odometry heading, depth quiet) over the last few s
+        self._return = None                 # the heading to go back to after an avoidance
         self._uturn = None
         self._uturn_wanted_since = None
         self._uturn_blocked_until = None
@@ -1858,6 +1912,7 @@ class TulakObstacle(Node):
         self.gps_course_min_speed = config.get('gps_course_min_speed', 0.2)
         self.gps_course = None       # radians, compass convention
         self.gps_course_time = None  # self.time it was received
+        self.gps_course_odo = None   # odometry heading at that moment - carries the course forward
         self.gps_course_max_age = datetime.timedelta(
             seconds=config.get('gps_course_max_age_sec', 3.0))
         self.waypoint_reached = False
@@ -2177,6 +2232,24 @@ class TulakObstacle(Node):
         # first real obstacle_zones frame arrives instead of driving on
         # that default (see on_pose2d and on_obstacle_zones)
         self.have_obstacle_data = False
+        # ... and the same after boot, when the camera stops sending. Nothing
+        # did before: the app kept steering on its last depth profile and
+        # its last mask. 2026-09-28 150409 and 150552 (CZU test10): depth,
+        # IMU, colour and mask all stopped, Matty drove on at 0.5 m/s with
+        # no eyes for 9.6 and 9.9 s, and then the whole process died (no
+        # e-stop, the log cut mid-cycle). It is not new - the older sets hold
+        # 12 stalls of 7-11 s while a speed was commanded, the camera
+        # recovering after each, with 2.7-5.3 m driven blind in every one,
+        # six of them in the competition runs (094022, 095732, 124117,
+        # 133922 twice, 135948). A healthy camera never leaves a gap over
+        # 0.60 s (p99.99 of 167 920 depth frames while driving), so
+        # camera_timeout_sec 1.0 separates the two cleanly. The robot holds
+        # still until BOTH depth and mask are fresh again, then carries on
+        # with whatever it was doing - it has not moved. 0 = off.
+        self.camera_timeout_sec = config.get('camera_timeout_sec', 0.0)
+        self._last_depth_time = None
+        self._last_mask_time = None
+        self._camera_stalled = None     # what went silent, while holding
 
         # road following
         # Weight near rows over far ones when locating the road centre -
@@ -2390,7 +2463,14 @@ class TulakObstacle(Node):
             from heading_estimator import OdoGpsHeading
             self.heading_est = OdoGpsHeading(alpha=config.get('heading_offset_alpha', 0.5),
                                              min_baseline_m=config.get('heading_min_baseline_m', 4.0),
-                                             valid_travel_m=config.get('heading_valid_travel_m', 60.0))
+                                             valid_travel_m=config.get('heading_valid_travel_m', 60.0),
+                                             max_baseline_sec=config.get('heading_max_baseline_sec', 15.0),
+                                             gate_deg=config.get('heading_gate_deg', 0.0),
+                                             cog_agree_deg=config.get('heading_cog_agree_deg', 25.0),
+                                             consensus_n=config.get('heading_consensus_n', 3),
+                                             consensus_spread_deg=config.get('heading_consensus_spread_deg', 15.0),
+                                             jump_m=config.get('heading_jump_m', 0.0),
+                                             cog_veto_deg=config.get('heading_cog_veto_deg', 0.0))
         self._odom_heading = None
         self._odo_hist = deque()             # (odometry travel m, odometry heading) over the last few metres
         self._odo_travel = 0.0
@@ -3038,6 +3118,27 @@ class TulakObstacle(Node):
             [round(speed * 1000), round(math.degrees(steering_angle) * 100)]
         )
 
+    def _camera_silent(self):
+        """True while depth or mask has been silent for camera_timeout_sec
+        after having flowed - see camera_timeout_sec. Prints once on the way
+        in and once on the way out."""
+        if self.camera_timeout_sec <= 0 or self.time is None:
+            return False
+        silent = []
+        for name, seen in (('depth', self._last_depth_time), ('road mask', self._last_mask_time)):
+            if seen is not None:
+                age = (self.time - seen).total_seconds()
+                if age > self.camera_timeout_sec:
+                    silent.append('%s %.1f s' % (name, age))
+        if silent and self._camera_stalled is None:
+            self._camera_stalled = self.time
+            print(self.time, 'camera silent (%s) - stopping until it sends again' % ', '.join(silent))
+        elif not silent and self._camera_stalled is not None:
+            print(self.time, 'camera back after %.1f s - resuming'
+                  % (self.time - self._camera_stalled).total_seconds())
+            self._camera_stalled = None
+        return bool(silent)
+
     def on_emergency_stop(self, data):
         # Tracked as state, not just acted on once, so the hold survives
         # the next on_pose2d cycle. With terminate_on_stop=True (the
@@ -3584,6 +3685,7 @@ class TulakObstacle(Node):
             return
         self.gps_course = math.radians(cog) % (2 * math.pi)
         self.gps_course_time = self.time
+        self.gps_course_odo = self._odom_heading
 
     def _fresh_gps_course(self):
         """gps_course if recent enough to still describe where the robot is
@@ -3605,7 +3707,8 @@ class TulakObstacle(Node):
                 lon = -lon
             self.last_fix = (lat, lon)
             if self.heading_est is not None and self.time is not None:
-                self.heading_est.update_fix(self.time.total_seconds(), lat, lon)
+                self.heading_est.update_fix(self.time.total_seconds(), lat, lon,
+                                                  sog=data.get('sog'), cog=data.get('cog'))
 
             had_heading = self.travel_heading is not None
             if self.last_gps_pos is not None:
@@ -3810,6 +3913,7 @@ class TulakObstacle(Node):
 
     def on_depth_profile(self, data):
         self.depth_profile = data
+        self._last_depth_time = self.time
         # evaluated here rather than in on_obstacle_zones because
         # ObstacleDetector3DZones publishes obstacle_zones first and
         # depth_profile second for the same frame - by this point both
@@ -4063,6 +4167,7 @@ class TulakObstacle(Node):
         })
 
     def on_nn_mask(self, data):
+        self._last_mask_time = self.time
         if self.publish_road_axis:
             self._publish_road_axis(data)
         mask = data.copy()  # never modify the shared buffer in place
@@ -6086,6 +6191,34 @@ class TulakObstacle(Node):
                 return False, 'only %.2f m clear on the %s' % (flank, where)
         return True, ''
 
+    def _uturn_heading_ok(self, todo):
+        """(ok, why): may the robot turn around on the heading it has now?
+
+        The about-turn is the one manoeuvre a wrong heading turns into a
+        disaster - it points a good run backwards - so the heading it rests
+        on gets checked by something independent of the chords it was
+        learned from. The receiver's course over ground is velocity, from
+        carrier Doppler, and in 144532 it stayed within ~20 deg of the truth
+        while the reflected positions dragged the heading 100 deg off. It
+        is carried forward to now by the odometry rotation since its fix,
+        so a course from 2 s ago still counts after the robot has turned.
+        No course (standing, crawling, reversing) = no objection."""
+        if self.uturn_cog_margin > 0 and self.route_road_bearing is not None:
+            course = self._fresh_gps_course()
+            if (course is not None and self.gps_course_odo is not None
+                    and self._odom_heading is not None):
+                course_now = course - normalize_angle(self._odom_heading - self.gps_course_odo)
+                by_course = -normalize_angle(self.route_road_bearing - course_now)
+                if abs(by_course) < self.uturn_min_turn - self.uturn_cog_margin:
+                    return False, ('the GPS course puts the route only %+.0f deg away'
+                                   % math.degrees(by_course))
+        if self.uturn_settle_max_deg > 0 and self.heading_est is not None:
+            moved = self.heading_est.unsettled_deg(self.uturn_settle_m)
+            if moved > self.uturn_settle_max_deg:
+                return False, ('the heading moved %.0f deg over the last %.0f m'
+                               % (moved, self.uturn_settle_m))
+        return True, ''
+
     def _uturn_still_wanted(self):
         """Is the fork _arm_odometry_turn asked about still asking?
 
@@ -6151,6 +6284,14 @@ class TulakObstacle(Node):
             return False                # not on a road - find one first
         if self.route_off_road_m is not None and self.route_off_road_m > 2.0:
             return False                # the map says we are off the path anyway
+        ok, why = self._uturn_heading_ok(todo)
+        if not ok:
+            if (self._uturn_heading_note is None
+                    or (self.time - self._uturn_heading_note).total_seconds() >= 5.0):
+                self._uturn_heading_note = self.time
+                print(self.time, 'the route asks for a %.0f deg about-turn here, but %s - not '
+                                 'turning around on that heading' % (math.degrees(abs(todo)), why))
+            return False
         ok, why = self._uturn_room_ok(self._uturn_side(todo))
         if not ok:
             # once every uturn_retry_sec, not every cycle: on a noisy mask
@@ -6502,10 +6643,163 @@ class TulakObstacle(Node):
         # route_veto_authority, route_bearing_authority_max,
         # bearing_blend_road_frac) that could no longer change anything.
         hint = self._arrow_turn_hint()
-        steering = max(-self.avoid_steering, min(self.avoid_steering, local_dir + hint))
+        hold = self._heading_hold(abs(local_dir - self.last_dir * self._mask_trust()))
+        steering = max(-self.avoid_steering, min(self.avoid_steering, local_dir + hint + hold))
         self.steer_debug.update(branch='arrow', hint=hint, gps_weight=0.0, target=steering,
-                                branch_l=self.branch_road_left, branch_r=self.branch_road_right)
+                                branch_l=self.branch_road_left, branch_r=self.branch_road_right,
+                                hold=hold)
         return self._rate_limit_steering(steering, dt)
+
+    def _open_ground(self):
+        """Is the robot on paving the mask cannot bound - both road edges at
+        the picture border on most look-ahead rings from 2 to 6 m?"""
+        prof = self._road_profile
+        if not prof:
+            return False
+        rings = both = 0
+        for x, left, left_open, right_open in zip(prof['x'], prof['left'],
+                                                  prof['left_open'], prof['right_open']):
+            if 2.0 <= x <= 6.0 and left is not None:
+                rings += 1
+                both += bool(left_open and right_open)
+        return rings >= 3 and both >= self.heading_hold_open_frac * rings
+
+    def _hold_clear(self):
+        """Nothing near enough that steering toward a heading could matter
+        more than steering around it."""
+        near = [d for d in (self.left_dist, self.last_obstacle, self.right_dist) if d is not None]
+        return not near or min(near) > self.turning_dist * self.heading_hold_clear_factor
+
+    def _heading_hold(self, depth_dev):
+        """Extra steering (radians, + = left) on open paving - see
+        heading_hold_enabled / avoid_return_enabled in __init__. depth_dev is
+        how far the depth terms moved local_dir off the mask this cycle: a
+        swerve while it is large, quiet while it is small.
+
+        Never competes with avoidance: nothing while depth is steering, nothing
+        while anything is inside heading_hold_clear_factor x turning_dist,
+        nothing outside DRIVE or with an arrow armed, and never more than
+        heading_hold_max - the stop and turning distances and the avoidance
+        state machine are not touched."""
+        if not (self.heading_hold_enabled or self.avoid_return_enabled) \
+                or self._odom_heading is None or self.time is None:
+            return 0.0
+        now = self.time.total_seconds()
+        quiet = depth_dev < math.radians(3.0)
+        swerving = depth_dev >= math.radians(6.0)
+        self._odo_trail.append((now, self._odom_heading, quiet))
+        while self._odo_trail and now - self._odo_trail[0][0] > 4.0:
+            self._odo_trail.popleft()
+        if self._open_ground():
+            if self._open_since is None:
+                self._open_since = now
+        else:
+            self._open_since = None
+        is_open = self._open_since is not None and now - self._open_since >= self.heading_hold_open_sec
+        if self.state != State.DRIVE or self._arrow is not None:
+            self._drop_return(None)
+            self._hold_gap_since = None
+            return 0.0
+
+        # --- back to the heading from before an avoidance ---
+        if self.avoid_return_enabled:
+            if swerving and self._return is None:
+                self._remember_heading(now)
+            ret = self._return
+            if ret is not None:
+                if swerving:
+                    ret['quiet_since'] = None       # still going round it: keep the target, restart the lag
+                    return 0.0
+                if ret['quiet_since'] is None:
+                    ret['quiet_since'] = now
+                    ret['start_travel'] = self._odo_travel
+                if now - ret['quiet_since'] < self.avoid_return_lag_sec:
+                    return 0.0
+                err = normalize_angle(ret['target'] - self._odom_heading)
+                why = None
+                if abs(err) <= self.heading_hold_deadband:
+                    why = 'back on the heading it had before the avoidance'
+                elif self._odo_travel - ret['start_travel'] > self.avoid_return_max_m:
+                    why = 'gave up after %.0f m' % self.avoid_return_max_m
+                elif not is_open:
+                    why = 'road edges in view again - the mask steers'   # on a bounded road the mask brings it back
+                elif abs(err) > self.heading_hold_max_gap:
+                    why = '%.0f deg is not a lane change' % math.degrees(abs(err))
+                elif not self._return_agrees_with_route(err):
+                    why = 'the route does not run that way'
+                if why is not None:
+                    self._drop_return(why)
+                else:
+                    if not ret['announced']:
+                        ret['announced'] = True
+                        print(self.time, 'open ground after an avoidance - turning %+.0f deg back to '
+                                         'the heading it had before' % math.degrees(err))
+                    if not quiet or not self._hold_clear():
+                        return 0.0
+                    return max(-self.heading_hold_max, min(self.heading_hold_max, self.heading_hold_gain * err))
+
+        # --- toward the mapped road direction ---
+        if not self.heading_hold_enabled or not is_open or not quiet or not self._hold_clear():
+            self._hold_gap_since = None
+            self._hold_engaged = False
+            return 0.0
+        heading, source = self._current_heading()
+        if (heading is None or source != 'odo+gps' or not self.route_mode
+                or self.route_state != 'following' or self.route_road_bearing is None
+                or (self.route_cross_track_m is not None
+                    and abs(self.route_cross_track_m) > self.heading_hold_max_cross_m)
+                or (self.route_turn_dist_m is not None
+                    and self.route_turn_dist_m <= self.heading_hold_turn_clear_m)
+                or (self.heading_est is not None and self.heading_est.unsettled_deg(8.0) > 20.0)):
+            self._hold_gap_since = None
+            self._hold_engaged = False
+            return 0.0
+        gap = normalize_angle(self.route_road_bearing - heading)      # compass: + = road to the right
+        if abs(gap) <= self.heading_hold_deadband or abs(gap) > self.heading_hold_max_gap:
+            self._hold_gap_since = None
+            self._hold_engaged = False
+            return 0.0
+        if self._hold_gap_since is None:
+            self._hold_gap_since = now
+        if now - self._hold_gap_since < self.heading_hold_gap_sec:
+            return 0.0
+        if not self._hold_engaged:
+            self._hold_engaged = True
+            print(self.time, 'open ground, %.0f deg off the mapped road for %.0f s - leaning back toward it'
+                  % (math.degrees(gap), now - self._hold_gap_since))
+        return max(-self.heading_hold_max, min(self.heading_hold_max, -self.heading_hold_gain * gap))
+
+    def _remember_heading(self, now):
+        """Take the heading the robot held just before an avoidance began,
+        from the trail of quiet cycles."""
+        pre = [h for t, h, q in self._odo_trail if now - 2.0 <= t <= now - 0.3 and q]
+        if pre:
+            s = sum(math.sin(h) for h in pre)
+            c = sum(math.cos(h) for h in pre)
+            self._return = dict(target=math.atan2(s, c), quiet_since=None, start_travel=None,
+                                announced=False)
+
+    def _drop_return(self, why):
+        if self._return is not None and why is not None and self._return.get('announced'):
+            print(self.time, 'heading return ended - %s' % why)
+        self._return = None
+
+    def _return_agrees_with_route(self, err):
+        """With a route and a trusted heading, the heading to return to must
+        also be the way the mapped road runs, and nearer to it than where the
+        robot points now. The first replay over 98 logs said why: of the 4
+        returns that had a route, 2 would have turned AWAY from it - czu9
+        162302 t=152 was already 5 deg off the road and the old heading was
+        10 deg off the other way. Without a route the old heading is all
+        there is, and it is used as it is."""
+        heading, source = self._current_heading()
+        if (not self.route_mode or self.route_state not in ('following', 'recovering')
+                or heading is None or source != 'odo+gps' or self.route_road_bearing is None):
+            return True
+        target = heading - err                  # odometry is anticlockwise, compass clockwise
+        to_target = abs(normalize_angle(target - self.route_road_bearing))
+        to_now = abs(normalize_angle(heading - self.route_road_bearing))
+        return to_target <= self.avoid_return_route_agree and to_target < to_now
 
     def _following_status(self):
         """Human-readable reason why the route is or is not steering the
@@ -6787,6 +7081,8 @@ class TulakObstacle(Node):
         if self.saved_heading is not None:
             return  # already mid-cycle
         self.saved_heading = self.last_heading
+        if self.avoid_return_enabled and self._return is None and self.time is not None:
+            self._remember_heading(self.time.total_seconds())   # see _heading_hold
         self._turn_sign_committed = False  # fresh episode - see _choose_turn_sign
         # last_heading (IMU yaw) has no known fixed relationship to true
         # north - see _drive_steering()'s docstring - but it should still
@@ -6910,6 +7206,13 @@ class TulakObstacle(Node):
             self.send_speed_cmd(0, 0)
             self._last_commanded_speed = 0.0
             self._last_commanded_steering = 0.0
+            return
+
+        if self._camera_silent():
+            # see camera_timeout_sec - hold, do not let anything below
+            # steer on a frozen picture
+            self.send_speed_cmd(0, 0)
+            self._last_commanded_speed = 0.0
             return
 
         if not self.have_obstacle_data:

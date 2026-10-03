@@ -1205,7 +1205,14 @@ class OSMRouter(Node):
             from heading_estimator import OdoGpsHeading
             self.heading_est = OdoGpsHeading(alpha=config.get('heading_offset_alpha', 0.5),
                                              min_baseline_m=config.get('heading_min_baseline_m', 4.0),
-                                             valid_travel_m=config.get('heading_valid_travel_m', 60.0))
+                                             valid_travel_m=config.get('heading_valid_travel_m', 60.0),
+                                             max_baseline_sec=config.get('heading_max_baseline_sec', 15.0),
+                                             gate_deg=config.get('heading_gate_deg', 0.0),
+                                             cog_agree_deg=config.get('heading_cog_agree_deg', 25.0),
+                                             consensus_n=config.get('heading_consensus_n', 3),
+                                             consensus_spread_deg=config.get('heading_consensus_spread_deg', 15.0),
+                                             jump_m=config.get('heading_jump_m', 0.0),
+                                             cog_veto_deg=config.get('heading_cog_veto_deg', 0.0))
         # Plan start on the way that runs along the heading, not merely the
         # nearest - see RoadGraph.snap_consistent. 0 = nearest (previous).
         self.snap_heading_m_per_deg = config.get('snap_heading_m_per_deg', 0.0)
@@ -1707,7 +1714,8 @@ class OSMRouter(Node):
         self.last_fix = (lat, lon)
         self.last_fix_time = self.time
         if self.heading_est is not None and self.time is not None:
-            self.heading_est.update_fix(self.time.total_seconds(), lat, lon)
+            self.heading_est.update_fix(self.time.total_seconds(), lat, lon,
+                                              sog=data.get('sog'), cog=data.get('cog'))
         self._select_map(self.last_fix)
         # AFTER the map is chosen: _use_map resets the graph to the whole
         # map, so applying the area first (as before) left the very first
